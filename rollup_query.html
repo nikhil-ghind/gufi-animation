@@ -1,0 +1,869 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GUFI — rollup, then query</title>
+<style>
+  :root{ --bg:#0a0e15; --line:#1e2942; --text:#e5edfa; --dim:#7f8ea8; }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--text);overflow:hidden;
+       font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  #app{display:flex;flex-direction:column;height:100vh}
+  header{display:flex;align-items:center;gap:16px;padding:12px 20px;
+         border-bottom:1px solid var(--line);background:#0d1320}
+  h1{font-size:15px;margin:0;font-weight:600}
+  h1 span{color:var(--dim);font-weight:400}
+  h1 a{color:#5aa9ff;text-decoration:none;font-weight:400;font-size:13px;margin-left:10px}
+  h1 a:hover{text-decoration:underline}
+  .sp{margin-left:auto;display:flex;gap:10px;align-items:center}
+  button,select{background:#182236;color:var(--text);border:1px solid var(--line);
+         border-radius:7px;padding:7px 12px;font:inherit;cursor:pointer}
+  button:hover,select:hover{background:#1f2b45}
+  button.on{background:#24365a;border-color:#3f6da8;color:#cfe2ff}
+  .spd{display:flex;align-items:center;gap:7px;color:var(--dim);font-size:13px}
+  .acts{display:flex;gap:6px;margin-right:6px}
+  canvas{display:block;flex:1;width:100%}
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>GUFI <span id="subtitle">— rollup</span><a href="index.html">← full scan</a></h1>
+    <div class="sp">
+      <span class="acts">
+        <button id="act1" class="on">① Rollup</button>
+        <button id="act2">② Query</button>
+      </span>
+      <span class="spd">threads
+        <select id="threads">
+          <option value="2">2</option>
+          <option value="3">3</option>
+          <option value="4" selected>4</option>
+          <option value="6">6</option>
+          <option value="8">8</option>
+        </select>
+      </span>
+      <span class="spd">speed
+        <select id="speed">
+          <option value="0.25">0.25×</option>
+          <option value="0.5">0.5×</option>
+          <option value="0.75">0.75×</option>
+          <option value="1" selected>1×</option>
+          <option value="1.5">1.5×</option>
+          <option value="2">2×</option>
+        </select>
+      </span>
+      <button id="play">⏸ Pause</button>
+      <button id="reset">↻ Restart</button>
+    </div>
+  </header>
+  <canvas id="c"></canvas>
+</div>
+<script>
+"use strict";
+
+/* =============================================================
+   Act 1 models src/gufi_rollup.c + src/BottomUp.c (parallel_bottomup)
+   Act 2 models src/gufi_query/processdir.c + process_queries.c
+   ============================================================= */
+
+let   NTHREADS = 4;
+const NDIRS    = 22;
+
+/* rollup timings (seconds at 1x) */
+const T_DESCEND  = 0.85;   // opendir on an index directory, note its children
+const T_ASC_BASE = 0.70;   // can_rollup() + should_rollup()
+const T_ASC_ROW  = 0.010;  // per row copied into pentries_rollup
+
+/* query timings — the open is what rollup saves, the rows are what it does not */
+const T_QOPEN    = 0.80;   // opendir + attachdb(db.db) + addqueryfuncs
+const T_QSUM     = 0.28;   // -S summary SQL
+const T_QROW     = 0.014;  // per row of the -E entries SQL
+
+/* the animation's own rollup ceiling — real GUFI's is a tunable row threshold */
+const ROW_LIMIT  = 88;
+
+const mulberry32=a=>function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296};
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+function roundRect(g,x,y,w,h,r){r=Math.min(r,w/2,h/2);g.beginPath();g.moveTo(x+r,y);
+  g.arcTo(x+w,y,x+w,y+h,r);g.arcTo(x+w,y+h,x,y+h,r);g.arcTo(x,y+h,x,y,r);g.arcTo(x,y,x+w,y,r);g.closePath();}
+
+const BASE_COLORS = ["#5aa9ff","#ff7ab8","#ffc247","#a78bfa"];
+const _tcol = BASE_COLORS.slice();
+function hsl2hex(h,s,l){
+  const a = s*Math.min(l,1-l);
+  const f = n => { const k=(n+h/30)%12, c=l-a*Math.max(-1,Math.min(k-3,9-k,1));
+                   return Math.round(255*c).toString(16).padStart(2,"0"); };
+  return "#"+f(0)+f(8)+f(4);
+}
+function tcol(i){
+  if (!_tcol[i]) _tcol[i] = hsl2hex((i*137.508+188)%360, 0.74, 0.66);
+  return _tcol[i];
+}
+const C_IDLE   = "#1a2334";   // untouched
+const C_SEEN   = "#26354f";   // discovered on the way down
+const C_WAIT   = "#3a4d70";   // waiting for children to finish
+const C_ROLL   = "#8b5cf6";   // rolled up: holds its descendants' entries
+const C_ROLL_E = "#c4b5fd";
+const C_BLOCK  = "#ef6161";   // refused rollup
+const C_DONE   = "#1f7d63";
+const C_DONE_E = "#3ee0b0";
+const C_HIT    = "#ffc247";
+
+/* ------------------------- tree ---------------------------- */
+/* Same shape as the scan animation, plus a permission mode per directory:
+   a child whose mode differs from its parent's blocks can_rollup(). */
+function buildTree(n, seed){
+  const rnd = mulberry32(seed), nodes = [];
+  const mk = (parent, depth) => {
+    const nd = {id:nodes.length, parent, depth, kids:[], files:0, mode:"0755",
+                remaining:0, seen:false, state:"idle", owner:-1,
+                rolled:false, blocked:null, rows:0, pop:0,
+                qa:"none", qb:"none", ax:0, ay:0, bx:0, by:0};
+    nodes.push(nd); if (parent>=0) nodes[parent].kids.push(nd.id); return nd;
+  };
+  const root = mk(-1,0); root.name = "/idx";
+  const q = [root];
+  while (nodes.length < n && q.length){
+    const cur = q.shift();
+    if (cur.depth >= 3) continue;
+    const k = cur.depth === 0 ? 4 : 1 + Math.floor(rnd()*3);
+    for (let i=0;i<k && nodes.length<n;i++){
+      const c = mk(cur.id, cur.depth+1); c.name = "d"+c.id; q.push(c);
+    }
+  }
+  for (const nd of nodes){
+    nd.files = 3 + Math.floor(rnd()*9);
+    if (rnd() < 0.16) nd.files = 20 + Math.floor(rnd()*14);      // a few heavy dirs
+  }
+  /* one private directory somewhere deep: its mode differs from its parent's,
+     which is exactly what can_rollup() refuses to merge across */
+  const deep = nodes.filter(x => x.depth >= 2 && x.parent > 0);
+  if (deep.length){
+    const pick = deep[Math.floor(rnd()*deep.length)];
+    pick.mode = "0700";
+  }
+  let leaf = 0;
+  const maxD = nodes.reduce((m,x)=>Math.max(m,x.depth),0);
+  (function visit(id){
+    const nd = nodes[id];
+    if (!nd.kids.length) nd.ux = leaf++;
+    else { for (const k of nd.kids) visit(k);
+           nd.ux = (nodes[nd.kids[0]].ux + nodes[nd.kids[nd.kids.length-1]].ux)/2; }
+  })(0);
+  const S = Math.max(1, leaf-1);
+  for (const nd of nodes){ nd.nx = nd.ux/S; nd.ny = maxD ? nd.depth/maxD : 0; }
+  nodes.leaves = leaf; nodes.maxDepth = maxD;
+  return nodes;
+}
+
+/* --------------------- the thread pool ---------------------- */
+/* Same QPTPool shape as the scan: round-robin enqueue, claim the whole
+   waiting queue at once, steal half of a neighbour's when idle. */
+class Pool {
+  constructor(N, host){
+    this.N = N; this.host = host; this.threads = [];
+    for (let i=0;i<N;i++)
+      this.threads.push({id:i, waiting:[], claimed:[], cur:null, label:"",
+                         t:0, dur:0, nextQueue:i, stealFrom:i, done:0, flash:0});
+    this.inflight = 0;
+  }
+  enqueue(item, src){
+    let target = 0;
+    if (src){ target = src.nextQueue; src.nextQueue = (src.nextQueue+1) % this.N; }
+    this.threads[target].waiting.push(item);
+    this.inflight++;
+  }
+  trySteal(th){
+    for (let i=1;i<this.N;i++){
+      const v = this.threads[(th.stealFrom+i) % this.N];
+      if (v === th || !v.waiting.length) continue;
+      const take = Math.max(Math.floor(v.waiting.length/2), 1);
+      th.claimed.push(...v.waiting.splice(0, take));
+      th.flash = 1; v.flash = 1;
+      th.stealFrom = (th.stealFrom+1) % this.N;
+      return true;
+    }
+    th.stealFrom = (th.stealFrom+1) % this.N;
+    return false;
+  }
+  idle(){ return this.threads.every(t => !t.cur) && !this.inflight; }
+  step(dt){
+    for (const th of this.threads){
+      th.flash = Math.max(0, th.flash - dt*0.8);
+      if (th.cur){
+        th.t += dt;
+        if (th.t >= th.dur){
+          const item = th.cur; th.cur = null; th.done++;
+          this.inflight--;
+          this.host.finish(th, item);
+        }
+        continue;
+      }
+      if (!th.claimed.length && th.waiting.length){
+        th.claimed.push(...th.waiting); th.waiting.length = 0;
+      }
+      if (!th.claimed.length && this.inflight > 0) this.trySteal(th);
+      if (th.claimed.length){
+        const item = th.claimed.shift();
+        th.cur = item; th.t = 0; th.dur = this.host.start(th, item);
+      }
+    }
+  }
+}
+
+/* ======================= ACT 1 — ROLLUP ====================== */
+/* parallel_bottomup(): descend to discover, then run work on the way back
+   up. A directory's ascend fires only once refs.remaining hits zero. */
+class RollupSim {
+  constructor(nodes){
+    this.nodes = nodes; this.time = 0; this.caption = null;
+    this.rolledCount = 0; this.blockedCount = 0; this.merged = 0;
+    this.decision = null; this.finished = false;
+    this.pool = new Pool(NTHREADS, this);
+    this.pool.enqueue({node:0, kind:"descend"}, null);
+    this.say("The index root is handed to the pool — rollup walks DOWN first",
+             "parallel_bottomup(): discover the tree, then do the work on the way back up", "sys", 4);
+  }
+  say(text, sub, kind, prio){
+    if (this.caption && prio < this.caption.prio && this.time - this.caption.t < 2.2) return;
+    this.caption = {text, sub, kind, prio, t:this.time};
+  }
+  start(th, item){
+    const n = this.nodes[item.node];
+    n.owner = th.id;
+    if (item.kind === "descend"){
+      n.state = "descending"; th.label = "descend " + n.name;
+      return T_DESCEND;
+    }
+    n.state = "ascending"; th.label = "ascend " + n.name;
+    return T_ASC_BASE + this.mergedRows(n)*T_ASC_ROW;
+  }
+  mergedRows(n){
+    let r = n.files;
+    for (const k of n.kids) r += this.nodes[k].rows || 0;
+    return r;
+  }
+  /* can_rollup(): every child must already be rolled up, and no child may
+     carry permissions that would expose rows the parent's mode would hide */
+  canRollup(n){
+    for (const k of n.kids){
+      const c = this.nodes[k];
+      if (c.mode !== n.mode)
+        return {ok:false, tag:"perms",
+                why:`child ${c.name} is ${c.mode}, this directory is ${n.mode}`};
+      if (!c.rolled)
+        return {ok:false, tag:"child", why:`child ${c.name} is not rolled up`};
+    }
+    return {ok:true};
+  }
+  finish(th, item){
+    const n = this.nodes[item.node];
+    if (item.kind === "descend"){
+      n.seen = true; n.state = n.kids.length ? "waiting" : "seen";
+      n.remaining = n.kids.length;
+      for (const k of n.kids) this.pool.enqueue({node:k, kind:"descend"}, th);
+      if (n.kids.length)
+        this.say(`${n.name} has ${n.kids.length} subdirectories — its work is deferred`,
+                 `BottomUp: refs.remaining = ${n.kids.length}; ascend() cannot fire until they all finish`,
+                 "descend", 3);
+      else
+        this.pool.enqueue({node:n.id, kind:"ascend"}, th);
+      return;
+    }
+
+    /* ascend: the rollup decision for this directory */
+    const rows = this.mergedRows(n);
+    const can = this.canRollup(n);
+    const should = rows <= ROW_LIMIT;
+    n.rolled = can.ok && should;
+    n.blocked = n.rolled ? null : (!can.ok ? "can_rollup" : "should_rollup");
+    n.blockTag = n.rolled ? null : (!can.ok ? can.tag : "too big");
+    n.rows = n.rolled ? rows : n.files;
+    n.state = "settled"; n.pop = 1;
+    this.decision = {node:n.id, rows, can, should, at:this.time};
+
+    if (n.rolled){
+      this.rolledCount++;
+      const absorbed = rows - n.files;
+      if (absorbed > 0){
+        this.merged += absorbed;
+        this.say(`${n.name} rolls up — ${absorbed} rows from below now live in its own db.db`,
+                 `rollup_ascend(): descendants' entries are copied into pentries_rollup, summary.isrolledup = 1`,
+                 "roll", 7);
+      } else {
+        this.say(`${n.name} rolls up (a leaf — nothing below it to merge)`,
+                 `summary.isrolledup = 1: a query that reaches here does not need to descend`, "roll", 2);
+      }
+    } else if (n.blocked === "can_rollup"){
+      this.blockedCount++;
+      this.say(`${n.name} CANNOT roll up — ${can.why}`,
+               `can_rollup(): merging would let a query see rows the permissions hide`, "block", 9);
+    } else {
+      this.blockedCount++;
+      this.say(`${n.name} refuses to roll up — ${rows} rows exceeds the ${ROW_LIMIT}-row limit`,
+               `should_rollup(): past a point one huge db.db is slower to query than descending`,
+               "block", 8);
+    }
+
+    if (n.parent >= 0){
+      const p = this.nodes[n.parent];
+      if (--p.remaining === 0) this.pool.enqueue({node:p.id, kind:"ascend"}, th);
+    }
+  }
+  step(dt){
+    this.time += dt;
+    this.pool.step(dt);
+    for (const n of this.nodes) if (n.pop>0) n.pop = Math.max(0, n.pop - dt);
+    if (!this.finished && this.pool.idle()){
+      this.finished = true;
+      this.say(`Rollup done — ${this.rolledCount}/${this.nodes.length} directories are rolled up`,
+               `${this.blockedCount} refused; a query can now stop at every rolled-up directory`, "sys", 10);
+    }
+  }
+}
+
+/* ======================== ACT 2 — QUERY ====================== */
+/* One traversal per side, same tree, same SQL. The rolled-up side stops
+   descending wherever summary.isrolledup is set. */
+class Side {
+  constructor(nodes, useRollup, host){
+    this.nodes = nodes; this.useRollup = useRollup; this.host = host;
+    this.key = useRollup ? "qa" : "qb";
+    this.visited = 0; this.opens = 0; this.rows = 0; this.skipped = 0;
+    this.busy = 0; this.done = false; this.elapsed = 0;
+    this.pool = new Pool(NTHREADS, this);
+    this.pool.enqueue({node:0}, null);
+  }
+  rowsAt(n){ return (this.useRollup && n.rolled) ? n.rows : n.files; }
+  start(th, item){
+    const n = this.nodes[item.node];
+    n[this.key] = "querying"; th.label = n.name;
+    this.opens++;
+    return T_QOPEN + T_QSUM + this.rowsAt(n)*T_QROW;
+  }
+  finish(th, item){
+    const n = this.nodes[item.node];
+    n[this.key] = "done";
+    this.visited++; this.rows += this.rowsAt(n);
+
+    /* process_queries(): descent happens unless this directory is rolled up */
+    if (this.useRollup && n.rolled){
+      const sub = this.countSubtree(n) - 1;
+      if (sub > 0){
+        this.skipped += sub;
+        this.markSkipped(n);
+        this.host.say(`${n.name} is rolled up — the query stops here, ${sub} directories never opened`,
+                      `process_queries(): get_isrolledup() is set, so gq_descend() is skipped entirely`,
+                      "roll", 8);
+      }
+      return;
+    }
+    for (const k of n.kids){ this.nodes[k][this.key] = "queued"; this.pool.enqueue({node:k}, th); }
+  }
+  countSubtree(n){
+    let c = 1; for (const k of n.kids) c += this.countSubtree(this.nodes[k]); return c;
+  }
+  markSkipped(n){
+    for (const k of n.kids){
+      const c = this.nodes[k];
+      c[this.key] = "absorbed"; this.markSkipped(c);
+    }
+  }
+  step(dt){
+    if (this.done) return;
+    this.elapsed += dt;
+    this.pool.step(dt);
+    if (this.pool.idle()) this.done = true;
+  }
+}
+
+class QuerySim {
+  constructor(nodes){
+    this.nodes = nodes; this.time = 0; this.caption = null; this.finished = false;
+    for (const n of nodes){ n.qa = n.qb = "none"; }
+    this.A = new Side(nodes, true,  this);
+    this.B = new Side(nodes, false, this);
+    this.say("Same query, same tree, two indexes — one rolled up, one not",
+             "gufi_query -S <summary SQL> -E <entries SQL>: attachdb(db.db) per directory", "sys", 4);
+  }
+  say(text, sub, kind, prio){
+    if (this.caption && prio < this.caption.prio && this.time - this.caption.t < 2.2) return;
+    this.caption = {text, sub, kind, prio, t:this.time};
+  }
+  step(dt){
+    this.time += dt;
+    this.A.step(dt); this.B.step(dt);
+    if (!this.A.done && this.A.pool.idle()) this.A.done = true;
+    if (this.A.done && !this.finished && !this.B.done)
+      this.say(`Rolled-up index finished: ${this.A.opens} database opens, ${this.A.skipped} directories skipped`,
+               `the plain index is still going — it has to open every one of them`, "roll", 9);
+    if (!this.finished && this.A.done && this.B.done){
+      this.finished = true;
+      const saved = this.B.opens - this.A.opens;
+      this.say(`Same ${this.B.rows} rows scanned, ${saved} fewer database opens`,
+               `rollup does not read less data — it removes the per-directory opendir + ATTACH`,
+               "sys", 10);
+    }
+  }
+}
+
+/* --------------------------- render -------------------------- */
+const cv = document.getElementById("c"), g = cv.getContext("2d");
+let W=0,H=0;
+function resize(){
+  const dpr = Math.min(2, devicePixelRatio||1), r = cv.getBoundingClientRect();
+  W=r.width; H=r.height; cv.width=Math.round(W*dpr); cv.height=Math.round(H*dpr);
+  g.setTransform(dpr,0,0,dpr,0,0);
+}
+
+let L = {};
+function computeLayout(sim, act){
+  const pad = 16, capH = 88;
+  L.cap = {x:pad, y:pad, w:W-pad*2, h:capH};
+  const bodyY = pad + capH + 12, bodyH = H - bodyY - pad;
+
+  if (act === 1){
+    const splitX = Math.round(W*0.56);
+    L.tree = {x:pad, y:bodyY, w:splitX-pad*1.5, h:bodyH};
+    const rx = splitX+pad*0.5, rw = W-pad-(splitX+pad*0.5);
+    const poolH = Math.max(150, bodyH*0.46);
+    L.pool = {x:rx, y:bodyY, w:rw, h:poolH};
+    L.dec  = {x:rx, y:bodyY+poolH+12, w:rw, h:bodyH-poolH-12};
+    placeTree(sim.nodes, L.tree, "a");
+    layoutLanes(L.pool, NTHREADS);
+  } else {
+    const statH = 132, half = (W-pad*2-12)/2;
+    L.ta = {x:pad,            y:bodyY, w:half, h:bodyH-statH-12};
+    L.tb = {x:pad+half+12,    y:bodyY, w:half, h:bodyH-statH-12};
+    L.stat = {x:pad, y:bodyY+bodyH-statH, w:W-pad*2, h:statH};
+    placeTree(sim.nodes, L.ta, "a");
+    placeTree(sim.nodes, L.tb, "b");
+  }
+}
+
+function placeTree(nodes, P, key){
+  P.ix = P.x + 34; P.iw = P.w - 68;
+  P.iy = P.y + 58; P.ih = P.h - 58 - 62;   // bottom room for the legend
+  const spacing = P.iw / Math.max(1, nodes.leaves - 1);
+  const rowGap  = P.ih / Math.max(1, nodes.maxDepth);
+  P.R = clamp(Math.min(21, spacing*0.44, rowGap*0.34), 10, 21);
+  for (const n of nodes){
+    n[key+"x"] = P.ix + n.nx*P.iw;
+    n[key+"y"] = P.iy + n.ny*P.ih;
+  }
+}
+
+function layoutLanes(P, N){
+  const headH = 40, gap = N > 6 ? 6 : 10;
+  const avail = P.h - headH - gap*(N-1) - 8;
+  const h = Math.min(64, avail/N);
+  const top = P.y + headH + (avail - h*N)/2;
+  L.lanes = [];
+  for (let i=0;i<N;i++) L.lanes.push({x:P.x+14, y:top+i*(h+gap), w:P.w-28, h});
+}
+
+function fitText(txt,x,y,maxW){
+  if (g.measureText(txt).width <= maxW){ g.fillText(txt,x,y); return; }
+  let t = txt;
+  while (t.length>1 && g.measureText(t+"…").width > maxW) t = t.slice(0,-1);
+  g.fillText(t+"…",x,y);
+}
+
+function panel(P,title,sub){
+  roundRect(g,P.x,P.y,P.w,P.h,12); g.fillStyle="#0e1420"; g.fill();
+  g.strokeStyle="#1c2740"; g.lineWidth=1; g.stroke();
+  g.fillStyle="#8ea0bd"; g.font="600 12px ui-monospace,monospace";
+  g.fillText(title, P.x+18, P.y+25);
+  if (sub){
+    const off = P.x+18+g.measureText(title).width+16;
+    g.fillStyle="#57678a"; g.font="11px ui-monospace,monospace";
+    fitText(sub, off, P.y+25, P.x+P.w-18-off);
+  }
+}
+
+function legend(P, items){
+  let x = P.x+18; const y = P.y+P.h-14;
+  g.font="10px ui-monospace,monospace";
+  for (const [txt,fill,edge] of items){
+    g.beginPath(); g.arc(x+5,y-4,5,0,7); g.fillStyle=fill; g.fill();
+    g.strokeStyle=edge||"#39496a"; g.lineWidth=1; g.stroke();
+    g.fillStyle="#6c7c98"; g.fillText(txt, x+15, y);
+    x += 15 + g.measureText(txt).width + 16;
+  }
+}
+
+/* one tree drawing routine, driven by a per-act style callback */
+function drawTree(P, nodes, key, style){
+  const R = P.R;
+  g.lineWidth = 1.4;
+  for (const n of nodes){
+    if (n.parent < 0) continue;
+    const p = nodes[n.parent];
+    g.strokeStyle = style.edge(n, p);
+    g.beginPath(); g.moveTo(p[key+"x"], p[key+"y"]);
+    g.bezierCurveTo(p[key+"x"], (p[key+"y"]+n[key+"y"])/2,
+                    n[key+"x"], (p[key+"y"]+n[key+"y"])/2, n[key+"x"], n[key+"y"]);
+    g.stroke();
+  }
+  for (const n of nodes){
+    const x = n[key+"x"], y = n[key+"y"], s = style.node(n);
+    if (s.halo){
+      g.beginPath(); g.arc(x, y, R+9+Math.sin(sim.time*4)*2, 0, 7);
+      g.strokeStyle = s.halo; g.lineWidth = 3.5; g.stroke();
+    }
+    if (n.pop > 0 && s.pop){
+      g.beginPath(); g.arc(x, y, R+(1-n.pop)*24, 0, 7);
+      g.strokeStyle = s.pop.replace("ALPHA", (n.pop*0.7).toFixed(2));
+      g.lineWidth = 2; g.stroke();
+    }
+    g.beginPath(); g.arc(x, y, R, 0, 7);
+    g.fillStyle = s.fill; g.fill();
+    g.strokeStyle = s.stroke; g.lineWidth = s.lw || 1.4; g.stroke();
+
+    const roomy = R >= 15;
+    g.textAlign = "center";
+    g.font = "600 12px ui-monospace,monospace"; g.fillStyle = s.text;
+    g.fillText(n.name.replace("/idx","/"), x, roomy && s.sub ? y-1 : y+4);
+    if (roomy && s.sub){
+      g.font = "600 10px ui-monospace,monospace"; g.fillStyle = s.subCol;
+      g.fillText(s.sub, x, y+11);
+    }
+    if (s.under){
+      g.font = "600 10px ui-monospace,monospace"; g.fillStyle = "#ffc98a";
+      g.fillText(s.under, x, y+R+13);
+    }
+    if (s.badge){
+      g.font = "600 9px ui-monospace,monospace";
+      const bw = g.measureText(s.badge).width + 10;
+      roundRect(g, x-bw/2, y-R-16, bw, 14, 4);
+      g.fillStyle = s.badgeBg; g.fill();
+      g.font = "600 9px ui-monospace,monospace"; g.fillStyle = s.badgeCol;
+      g.fillText(s.badge, x, y-R-5.5);
+    }
+    g.textAlign = "left";
+  }
+}
+
+/* ---------------------- act 1 rendering ---------------------- */
+function drawRollupTree(sim){
+  panel(L.tree, "GUFI INDEX",
+        `bottom-up rollup · merged rows must stay under ${ROW_LIMIT} · mode shown when it differs`);
+  drawTree(L.tree, sim.nodes, "a", {
+    edge: (n,p) => n.seen ? (n.rolled && p.rolled ? "#5b3fa8" : "#2c3f5f") : "#1b2434",
+    node: n => {
+      const s = {pop:`rgba(196,181,253,ALPHA)`, lw:1.4, subCol:"rgba(10,14,21,0.62)"};
+      if (n.state === "descending" || n.state === "ascending"){
+        s.halo = tcol(n.owner)+"55";
+        s.fill = tcol(n.owner); s.stroke = "#ffffff"; s.lw = 2.5;
+        s.text = "#0a0e15"; s.sub = n.files+"f";
+        if (n.state === "ascending") s.badge = "ascend", s.badgeBg = "#3b2d63", s.badgeCol = "#c4b5fd";
+      } else if (n.state === "settled" && n.rolled){
+        s.fill = C_ROLL; s.stroke = C_ROLL_E; s.lw = 2;
+        s.text = "#0a0e15"; s.sub = "Σ"+n.rows;
+      } else if (n.state === "settled"){
+        s.fill = "#3a1f2a"; s.stroke = C_BLOCK; s.lw = 2;
+        s.text = "#ffd9d9"; s.sub = n.files+"f"; s.subCol = "rgba(255,217,217,0.6)";
+        s.badge = n.blockTag;      // perms · child · too big
+        s.badgeBg = "#41202a"; s.badgeCol = "#ffb3b3";
+      } else if (n.state === "waiting"){
+        s.fill = C_WAIT; s.stroke = "#5b7099";
+        s.text = "#cfe0f8"; s.sub = n.files+"f"; s.subCol = "rgba(207,224,248,0.55)";
+        s.badge = `${n.kids.length-n.remaining}/${n.kids.length}`;
+        s.badgeBg = "#22314c"; s.badgeCol = "#9db8de";
+      } else if (n.seen){
+        s.fill = C_SEEN; s.stroke = "#3a4d70"; s.text = "#a8bcd8"; s.sub = n.files+"f";
+        s.subCol = "rgba(168,188,216,0.5)";
+      } else {
+        s.fill = C_IDLE; s.stroke = "#2b3852"; s.text = "#4a5876"; s.sub = null;
+      }
+      /* the odd permission mode goes UNDER the node: it is the cause of a
+         refusal, so it must stay visible next to the refusal badge */
+      if (n.mode !== "0755") s.under = n.mode;
+      return s;
+    }
+  });
+  legend(L.tree, [["not seen",C_IDLE],["waiting on children",C_WAIT],
+                  ["rolled up",C_ROLL,C_ROLL_E],["refused","#3a1f2a",C_BLOCK]]);
+}
+
+function drawPool(sim){
+  panel(L.pool, "THREAD POOL", `${NTHREADS} threads · descend down, ascend up`);
+  for (let i=0;i<NTHREADS;i++){
+    const th = sim.pool.threads[i], ln = L.lanes[i], col = tcol(i);
+    roundRect(g, ln.x, ln.y, ln.w, ln.h, 9);
+    g.fillStyle = th.cur ? "#131c2c" : "#101724"; g.fill();
+    g.strokeStyle = th.flash>0 ? `rgba(196,181,253,${0.3+th.flash*0.7})` : "#1d2840";
+    g.lineWidth = th.flash>0 ? 2 : 1; g.stroke();
+
+    const cy = ln.y + ln.h/2, R = Math.min(17, ln.h*0.32);
+    g.beginPath(); g.arc(ln.x+R+12, cy, R, 0, 7);
+    g.fillStyle = th.cur ? col+"22" : "#161f31"; g.fill();
+    g.strokeStyle = col; g.lineWidth = th.cur ? 2.4 : 1.4; g.stroke();
+    g.textAlign="center"; g.font=`600 ${R>14?13:11}px ui-monospace,monospace`; g.fillStyle=col;
+    g.fillText("T"+i, ln.x+R+12, cy+4); g.textAlign="left";
+
+    const tx = ln.x + R*2 + 24, maxTW = ln.w - (R*2+24) - 92;
+    if (th.cur){
+      const kind = th.cur.kind;
+      g.font="600 12px ui-monospace,monospace"; g.fillStyle = col;
+      fitText(th.label, tx, cy-3, maxTW);
+      g.font="10px ui-monospace,monospace"; g.fillStyle = kind==="ascend" ? "#c4b5fd" : "#8294b2";
+      fitText(kind==="ascend" ? "can_rollup() + merge" : "opendir + read children", tx, cy+11, maxTW);
+      g.fillStyle="#1a2437"; roundRect(g, ln.x+ln.w-84, cy-2, 68, 4, 2); g.fill();
+      g.fillStyle=col; roundRect(g, ln.x+ln.w-84, cy-2, 68*clamp(th.t/th.dur,0,1), 4, 2); g.fill();
+    } else {
+      g.font="600 11px ui-monospace,monospace"; g.fillStyle="#4a5771";
+      g.fillText(sim.pool.inflight ? "idle → stealing" : "exited", tx, cy+4);
+    }
+    const q = th.waiting.length + th.claimed.length;
+    if (q){
+      g.textAlign="right"; g.font="10px ui-monospace,monospace"; g.fillStyle="#61728f";
+      g.fillText(`${q} queued`, ln.x+ln.w-16, cy+16); g.textAlign="left";
+    }
+  }
+}
+
+function drawDecision(sim){
+  panel(L.dec, "ROLLUP DECISION", "gufi_rollup.c: rollup_ascend()");
+  const d = sim.decision, P = L.dec;
+  const x = P.x+18; let y = P.y+52;
+  if (!d){
+    g.font="11px ui-monospace,monospace"; g.fillStyle="#4a5771";
+    g.fillText("waiting for the first directory to finish its children…", x, y);
+    return;
+  }
+  const n = sim.nodes[d.node];
+  g.font="600 15px ui-monospace,monospace"; g.fillStyle = n.rolled ? C_ROLL_E : "#ff9d9d";
+  g.fillText(n.name, x, y);
+  g.font="11px ui-monospace,monospace"; g.fillStyle="#7f8ea8";
+  g.fillText(`mode ${n.mode} · ${n.files} own rows · ${n.kids.length} children`,
+             x + g.measureText(n.name).width + 14, y);
+  y += 26;
+
+  const line = (ok, head, detail) => {
+    g.font="600 11px ui-monospace,monospace"; g.fillStyle = ok ? C_DONE_E : C_BLOCK;
+    g.fillText(ok ? "✓" : "✗", x, y);
+    g.fillStyle = ok ? "#cfe0f8" : "#ffc4c4";
+    g.fillText(head, x+18, y);
+    g.font="11px ui-monospace,monospace"; g.fillStyle="#6c7c98";
+    fitText(detail, x+18+g.measureText(head).width+10, y, P.x+P.w-18-(x+18+g.measureText(head).width+10));
+    y += 20;
+  };
+  line(d.can.ok, "can_rollup()",
+       d.can.ok ? "every child rolled up, permissions match"
+                : d.can.why);
+  line(d.should, "should_rollup()",
+       `${d.rows} merged rows vs the ${ROW_LIMIT}-row limit`);
+  y += 6;
+  g.font="600 12px ui-monospace,monospace";
+  g.fillStyle = n.rolled ? C_ROLL_E : "#ff9d9d";
+  g.fillText(n.rolled ? `summary.isrolledup = 1  ·  pentries_rollup holds ${d.rows} rows`
+                      : `summary.isrolledup = 0  ·  a query must descend past ${n.name}`, x, y);
+  y += 24;
+  g.font="11px ui-monospace,monospace"; g.fillStyle="#57678a";
+  g.fillText(`rolled up ${sim.rolledCount} · refused ${sim.blockedCount} · ${sim.merged} rows moved upward`, x, y);
+}
+
+/* ---------------------- act 2 rendering ---------------------- */
+/* coordinates live on n.ax/n.ay ("a"), traversal state on n.qa/n.qb (side.key) */
+function queryStyle(side){
+  const key = side.key;
+  return {
+    edge: (n,p) => {
+      if (n[key] === "absorbed") return "#3a2b60";
+      return n[key] === "none" ? "#1b2434" : "#2c3f5f";
+    },
+    node: n => {
+      const st = n[key], s = {lw:1.4, subCol:"rgba(10,14,21,0.6)"};
+      /* purple means "this stopped a descent" — a rolled-up leaf saves nothing,
+         so it reads as an ordinary queried directory */
+      const rolled = side.useRollup && n.rolled && n.rows > n.files;
+      if (st === "querying"){
+        s.halo = C_HIT+"55"; s.fill = C_HIT; s.stroke = "#ffffff"; s.lw = 2.5;
+        s.text = "#0a0e15"; s.sub = side.rowsAt(n)+"r";
+      } else if (st === "absorbed"){
+        s.fill = "#1c1733"; s.stroke = "#3a2b60"; s.text = "#5b4d8a"; s.sub = null;
+        s.badge = null;
+      } else if (st === "done"){
+        s.fill = rolled ? C_ROLL : C_DONE; s.stroke = rolled ? C_ROLL_E : C_DONE_E;
+        s.lw = 1.8; s.text = "#0a0e15"; s.sub = side.rowsAt(n)+"r";
+      } else if (st === "queued"){
+        s.fill = "#26354f"; s.stroke = "#3a4d70"; s.text = "#a8bcd8"; s.sub = null;
+      } else {
+        s.fill = C_IDLE; s.stroke = "#2b3852"; s.text = "#4a5876"; s.sub = null;
+      }
+      /* badge only where the rollup actually absorbed something — a rolled-up
+         leaf stops nothing, and the labels collide on the bottom row */
+      if (rolled && (st === "done" || st === "querying")){
+        s.badge = "stop"; s.badgeBg = "#3b2d63"; s.badgeCol = "#c4b5fd";
+      }
+      return s;
+    }
+  };
+}
+
+function drawQuerySide(P, sim, side, key, title, sub){
+  panel(P, title, sub);
+  drawTree(P, sim.nodes, key, queryStyle(side));
+  const busy = side.pool.threads.filter(t => t.cur).length;
+  g.font="10px ui-monospace,monospace"; g.textAlign="right";
+  g.fillStyle = side.done ? C_DONE_E : "#61728f";
+  g.fillText(side.done ? `finished in ${side.elapsed.toFixed(1)}s`
+                       : `${busy}/${NTHREADS} threads busy · ${side.elapsed.toFixed(1)}s`,
+             P.x+P.w-18, P.y+25);
+  g.textAlign="left";
+  legend(P, side.useRollup
+    ? [["not reached",C_IDLE],["querying",C_HIT],["rolled up — stop here",C_ROLL,C_ROLL_E],
+       ["never opened","#1c1733","#3a2b60"]]
+    : [["not reached",C_IDLE],["querying",C_HIT],["queried",C_DONE,C_DONE_E]]);
+}
+
+function drawStats(sim){
+  const P = L.stat;
+  panel(P, "COST", "the same query, measured on both indexes");
+  const A = sim.A, B = sim.B;
+  const maxOpen = Math.max(1, B.opens, A.opens);
+  const maxTime = Math.max(1, A.elapsed, B.elapsed);
+
+  const row = (y, label, side, col) => {
+    g.font="600 12px ui-monospace,monospace"; g.fillStyle = col;
+    g.fillText(label, P.x+18, y+4);
+    const bx = P.x+188, bw = P.w - 188 - 300;
+    g.fillStyle="#151d2c"; roundRect(g, bx, y-7, bw, 14, 4); g.fill();
+    g.fillStyle=col+"cc";
+    roundRect(g, bx, y-7, Math.max(2, bw*side.opens/maxOpen), 14, 4); g.fill();
+    g.font="600 11px ui-monospace,monospace"; g.fillStyle="#0a0e15";
+    g.fillText(`${side.opens} db.db opened`, bx+10, y+4);
+
+    g.font="11px ui-monospace,monospace"; g.fillStyle="#8ea0bd";
+    const tx = bx+bw+18;
+    g.fillText(`${side.visited} visited · ${side.rows} rows`, tx, y+4);
+    g.fillStyle="#57678a";
+    g.fillText(`${side.elapsed.toFixed(1)}s`, P.x+P.w-52, y+4);
+    /* elapsed marker under the bar */
+    g.fillStyle="#1a2437"; roundRect(g, bx, y+11, bw, 3, 1.5); g.fill();
+    g.fillStyle=col+"66"; roundRect(g, bx, y+11, bw*clamp(side.elapsed/maxTime,0,1), 3, 1.5); g.fill();
+  };
+  row(P.y+56, "rolled-up index", A, "#a78bfa");
+  row(P.y+96, "plain index",     B, "#5aa9ff");
+
+  if (A.skipped){
+    g.font="11px ui-monospace,monospace"; g.fillStyle="#6c7c98";
+    g.textAlign="right";
+    g.fillText(`${A.skipped} directories never opened on the rolled-up side`, P.x+P.w-18, P.y+25);
+    g.textAlign="left";
+  }
+}
+
+/* ------------------------- caption --------------------------- */
+function drawCaption(sim){
+  const c = L.cap;
+  const kind = sim.caption ? sim.caption.kind : "sys";
+  const accent = kind==="roll" ? C_ROLL_E : kind==="block" ? C_BLOCK
+               : kind==="descend" ? "#5aa9ff" : "#8ea0bd";
+  roundRect(g,c.x,c.y,c.w,c.h,12);
+  g.fillStyle = "#101827"; g.fill();
+  g.strokeStyle = accent+"55"; g.lineWidth=1.5; g.stroke();
+  roundRect(g,c.x,c.y,7,c.h,12); g.fillStyle = accent; g.fill();
+  if (sim.caption){
+    const fade = clamp((sim.time - sim.caption.t)/0.25, 0, 1);
+    g.globalAlpha = 0.3 + 0.7*fade;
+    g.font = "600 25px ui-monospace,monospace"; g.fillStyle = "#f2f7ff";
+    fitText(sim.caption.text, c.x+28, c.y+38, c.w-56);
+    g.font = "15px ui-monospace,monospace"; g.fillStyle = accent;
+    fitText(sim.caption.sub, c.x+28, c.y+66, c.w-56);
+    g.globalAlpha = 1;
+  }
+}
+
+/* ----------------------------- app --------------------------- */
+let sim, act = 1, playing = true, speed = 1, seed = 11, nodes = null;
+const params = new URLSearchParams(location.search);
+
+function newTree(){ nodes = buildTree(NDIRS, seed); }
+
+/* Act 2 needs the rollup flags. Jumping straight to it runs act 1 headless. */
+function ensureRolledUp(){
+  if (nodes.some(n => n.state === "settled")) return;
+  const r = new RollupSim(nodes);
+  for (let i=0;i<20000 && !r.finished;i++) r.step(1/30);
+}
+
+function newSim(){
+  if (!nodes) newTree();
+  if (act === 1){
+    for (const n of nodes){
+      n.state="idle"; n.seen=false; n.rolled=false; n.blocked=null;
+      n.rows=0; n.remaining=0; n.pop=0; n.owner=-1;
+    }
+    sim = new RollupSim(nodes);
+  } else {
+    ensureRolledUp();
+    sim = new QuerySim(nodes);
+  }
+  document.getElementById("subtitle").textContent =
+    act === 1 ? "— rollup" : "— query";
+  document.getElementById("act1").classList.toggle("on", act===1);
+  document.getElementById("act2").classList.toggle("on", act===2);
+}
+
+let last = performance.now(), lastW=0, lastH=0;
+function frame(now){
+  const raw = Math.min(0.05, (now-last)/1000); last = now;
+  const r = cv.getBoundingClientRect();
+  if (Math.abs(r.width-lastW)>0.5 || Math.abs(r.height-lastH)>0.5){ lastW=r.width; lastH=r.height; resize(); }
+  computeLayout(sim, act);
+  if (playing){ let d = raw*speed; while (d>0){ const s = Math.min(1/120, d); sim.step(s); d -= s; } }
+
+  g.fillStyle = "#0a0e15"; g.fillRect(0,0,W,H);
+  drawCaption(sim);
+  if (act === 1){ drawRollupTree(sim); drawPool(sim); drawDecision(sim); }
+  else {
+    drawQuerySide(L.ta, sim, sim.A, "a", "ROLLED-UP INDEX", "descent stops where isrolledup = 1");
+    drawQuerySide(L.tb, sim, sim.B, "b", "PLAIN INDEX", "every directory must be opened");
+    drawStats(sim);
+  }
+  requestAnimationFrame(frame);
+}
+
+function setAct(a){ act = a; newSim(); }
+
+document.getElementById("play").onclick = e => {
+  playing = !playing; e.target.textContent = playing ? "⏸ Pause" : "▶ Play";
+};
+document.getElementById("speed").onchange = e => speed = parseFloat(e.target.value);
+document.getElementById("reset").onclick = () => { seed++; newTree(); newSim(); };
+document.getElementById("act1").onclick = () => setAct(1);
+document.getElementById("act2").onclick = () => setAct(2);
+
+const threadSel = document.getElementById("threads");
+const wantThreads = parseInt(params.get("threads")||"", 10);
+if (wantThreads >= 1 && wantThreads <= 16){
+  NTHREADS = wantThreads;
+  if (![...threadSel.options].some(o => +o.value === wantThreads))
+    threadSel.add(new Option(String(wantThreads), String(wantThreads)));
+  threadSel.value = String(wantThreads);
+}
+threadSel.onchange = e => { NTHREADS = parseInt(e.target.value,10); newSim(); };
+
+const wantSpeed = parseFloat(params.get("speed")||"");
+if (wantSpeed > 0){ speed = wantSpeed; document.getElementById("speed").value = String(wantSpeed); }
+if (params.get("act") === "2") act = 2;
+
+addEventListener("keydown", e => {
+  if (e.code === "Space"){ e.preventDefault(); document.getElementById("play").click(); }
+  if (e.key === "r"){ seed++; newTree(); newSim(); }
+  if (e.key === "1") setAct(1);
+  if (e.key === "2") setAct(2);
+});
+
+resize(); newTree(); newSim();
+const skip = parseFloat(params.get("skip")||"0");
+for (let k=0;k<skip*60;k++) sim.step(1/60);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

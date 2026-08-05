@@ -1,12 +1,15 @@
-# GUFI full-scan animation
+# GUFI animations
 
-A slow, self-contained JS/canvas animation of how a
-[GUFI](https://github.com/mar-file-system/gufi) full scan works: how the directory tree is
-turned into work units, how those units are divided among threads, how each thread drives
-its own two queues, and how an idle thread steals work from a neighbour.
+Slow, self-contained JS/canvas animations of how [GUFI](https://github.com/mar-file-system/gufi)
+walks a filesystem. No build step, no libraries, no network — each page is one HTML file.
 
-**[▶ Watch it live](https://nikhil-ghind.github.io/gufi-animation/)** — or open `index.html` in a
-browser. No build step, no libraries, no network.
+| | |
+|---|---|
+| **[▶ Full scan](https://nikhil-ghind.github.io/gufi-animation/)** (`index.html`) | building the index: work units, per-thread queues, work stealing |
+| **[▶ Rollup, then query](https://nikhil-ghind.github.io/gufi-animation/rollup_query.html)** (`rollup_query.html`) | bottom-up rollup, then the query that rollup makes cheap |
+
+The rest of this file describes the full-scan page; the rollup/query page is described
+[further down](#rollup-then-query).
 
 ## Reading the screen
 
@@ -63,3 +66,64 @@ termination when `incomplete == 0`. Timings are stretched for watchability, not 
 
 See [`GUFI_FULL_SCAN.md`](GUFI_FULL_SCAN.md) for the written walkthrough of the full scan
 pipeline with file:line references into the GUFI source.
+
+---
+
+# Rollup, then query
+
+`rollup_query.html` — two acts over one index, switched with the **① Rollup** / **② Query**
+buttons (or `1` / `2`).
+
+## Act 1 — rollup (bottom-up)
+
+`gufi_rollup` walks *down* to discover the tree and does its work *on the way back up*
+(`parallel_bottomup`). A directory's `ascend` cannot run until every child has finished, so
+each node carries a `2/3`-style badge: that is `refs.remaining` counting down.
+
+When `ascend` fires, two tests decide the directory's fate, and the panel on the right shows
+the actual comparison:
+
+- **`can_rollup()`** — every child must already be rolled up, and no child may carry
+  permissions that differ from this directory's. A `0700` directory under a `0755` parent
+  blocks the merge, because merging would let a query see rows the permissions hide.
+- **`should_rollup()`** — the merged row count must stay under the limit. Past that point one
+  huge `db.db` is slower to query than descending into several small ones.
+
+Pass both and the descendants' entries are copied into `pentries_rollup` and
+`summary.isrolledup` is set (purple, `Σ N`). Fail either and the directory is marked in red
+with the reason: `perms`, `child` (something below it refused), or `too big`.
+
+**Watch the poisoning.** A single `0700` directory refuses, which makes its parent refuse
+(`perms`), which makes *its* parent refuse (`child`) — one odd permission can walk all the way
+to the root. That is why rollup is usually partial, not all-or-nothing.
+
+## Act 2 — query (top-down), two indexes side by side
+
+The same `gufi_query -S … -E …` runs against the rolled-up index and a plain one, on the same
+tree, with the same threads. Per directory: `opendir` + `attachdb(db.db)`, the `-S` summary
+SQL, then the `-E` entries SQL. Descent happens *before* the SQL, to keep the pool fed.
+
+The rolled-up side calls `get_isrolledup()` and, where it is set, **skips `gq_descend()`
+entirely** — the subtree greys out as "never opened". The cost panel keeps both tallies.
+
+The payoff is worth stating precisely, because it is easy to overclaim: **both sides scan the
+same number of rows.** Rollup does not read less data. What it removes is the per-directory
+`opendir` + `ATTACH` — in the default tree, 22 database opens become 10.
+
+## Fidelity and honest limits
+
+Act 1 follows `src/gufi_rollup.c` (`rollup_descend`, `rollup_ascend`, `can_rollup`,
+`should_rollup`) and `src/BottomUp.c`; act 2 follows `src/gufi_query/processdir.c` and
+`process_queries.c`. Both reuse the QPTPool shape of the scan page.
+
+What is simplified, deliberately:
+
+- The row limit is **88**, a number chosen so a 22-directory tree produces an interesting mix.
+  Real GUFI's threshold is a tunable and much larger.
+- Permissions are a single mode string per directory; real `can_rollup()` compares
+  user/group/other bits properly.
+- Timings are stretched for watchability. The 4.8s-vs-8.8s gap shows the *shape* of the
+  speedup, not a benchmark.
+- `-T` treesummary pruning, `-a` aggregation, external attach, and xattr views are not drawn.
+
+URL presets, same as the scan page: `?act=2`, `?threads=8`, `?speed=0.5`, `?skip=10`.
