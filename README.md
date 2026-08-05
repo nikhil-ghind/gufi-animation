@@ -5,7 +5,8 @@ A slow, self-contained JS/canvas animation of how a
 turned into work units, how those units are divided among threads, how each thread drives
 its own two queues, and how an idle thread steals work from a neighbour.
 
-**Open `index.html` in a browser.** No build step, no libraries, no network.
+**[▶ Watch it live](https://nikhil-ghind.github.io/gufi-animation/)** — or open `index.html` in a
+browser. No build step, no libraries, no network.
 
 ## Reading the screen
 
