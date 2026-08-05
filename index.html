@@ -1,0 +1,649 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GUFI — full scan, per-thread queues, work stealing</title>
+<style>
+  :root{ --bg:#0a0e15; --line:#1e2942; --text:#e5edfa; --dim:#7f8ea8; }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--text);overflow:hidden;
+       font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  #app{display:flex;flex-direction:column;height:100vh}
+  header{display:flex;align-items:center;gap:16px;padding:12px 20px;
+         border-bottom:1px solid var(--line);background:#0d1320}
+  h1{font-size:15px;margin:0;font-weight:600}
+  h1 span{color:var(--dim);font-weight:400}
+  .sp{margin-left:auto;display:flex;gap:10px;align-items:center}
+  button,select{background:#182236;color:var(--text);border:1px solid var(--line);
+         border-radius:7px;padding:7px 12px;font:inherit;cursor:pointer}
+  button:hover,select:hover{background:#1f2b45}
+  .spd{display:flex;align-items:center;gap:7px;color:var(--dim);font-size:13px}
+  canvas{display:block;flex:1;width:100%}
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>GUFI full scan <span>— one directory = one work item · queue per thread · work stealing</span></h1>
+    <div class="sp">
+      <span class="spd">speed
+        <select id="speed">
+          <option value="0.25">0.25×</option>
+          <option value="0.5">0.5×</option>
+          <option value="0.75">0.75×</option>
+          <option value="1" selected>1×</option>
+          <option value="1.5">1.5×</option>
+          <option value="2">2×</option>
+        </select>
+      </span>
+      <button id="play">⏸ Pause</button>
+      <button id="reset">↻ Restart</button>
+    </div>
+  </header>
+  <canvas id="c"></canvas>
+</div>
+<script>
+"use strict";
+
+/* =============================================================
+   Models src/gufi_dir2index.c, src/descend.c, src/QueuePerThreadPool.c
+   ============================================================= */
+
+const NTHREADS = 4;
+const NDIRS    = 22;
+
+/* slow, readable timings (seconds at 1x) */
+const T_FLY      = 1.85;   // a work item travelling to a queue
+const T_OPEN     = 1.60;   // opendir + lstat + mkdir + copy db.db template
+const T_PER_KID  = 1.10;   // descend(): time between pushing subdirs
+const T_PER_FILE = 0.120;  // per entry: fstatat + sumit + insertdbgo
+const T_COMMIT   = 1.80;   // directory xattrs + summary row + COMMIT
+const STEAL_TRY  = 0.55;   // how often an idle thread retries stealing
+
+const mulberry32=a=>function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296};
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+const easeInOut=t=>t<.5?2*t*t:1-Math.pow(-2*t+2,2)/2;
+function roundRect(g,x,y,w,h,r){r=Math.min(r,w/2,h/2);g.beginPath();g.moveTo(x+r,y);
+  g.arcTo(x+w,y,x+w,y+h,r);g.arcTo(x+w,y+h,x,y+h,r);g.arcTo(x,y+h,x,y,r);g.arcTo(x,y,x+w,y,r);g.closePath();}
+
+const THREAD_COLORS = ["#5aa9ff","#ff7ab8","#ffc247","#a78bfa"];
+const C_QUEUED = "#4a6ea8";
+const C_DONE   = "#1f7d63";
+const C_DONE_E = "#3ee0b0";
+const C_STEAL  = "#ff7ab8";
+const RAIL_X   = 296;   // left edge of the queue rails inside a lane
+
+/* ------------------------- tree ---------------------------- */
+function buildTree(n, seed){
+  const rnd = mulberry32(seed), nodes = [];
+  const mk = (parent, depth) => {
+    const nd = {id:nodes.length, parent, depth, kids:[], files:0,
+                state:"undiscovered", owner:-1,        // source-tree state
+                idx:"none", idxPop:0,                  // index-tree state
+                x:0, y:0, ix:0, iy:0, pop:0};
+    nodes.push(nd); if (parent>=0) nodes[parent].kids.push(nd.id); return nd;
+  };
+  const root = mk(-1,0); root.name = "/data";
+  const q = [root];
+  while (nodes.length < n && q.length){
+    const cur = q.shift();
+    if (cur.depth >= 3) continue;
+    const k = cur.depth === 0 ? 4 : 1 + Math.floor(rnd()*3);
+    for (let i=0;i<k && nodes.length<n;i++){
+      const c = mk(cur.id, cur.depth+1); c.name = "d"+c.id; q.push(c);
+    }
+  }
+  for (const nd of nodes){
+    nd.files = 3 + Math.floor(rnd()*9);
+    if (rnd() < 0.18) nd.files = 22 + Math.floor(rnd()*10);   // a few heavy dirs
+  }
+  let leaf = 0;
+  const maxD = nodes.reduce((m,x)=>Math.max(m,x.depth),0);
+  (function visit(id){
+    const nd = nodes[id];
+    if (!nd.kids.length) nd.ux = leaf++;
+    else { for (const k of nd.kids) visit(k);
+           nd.ux = (nodes[nd.kids[0]].ux + nodes[nd.kids[nd.kids.length-1]].ux)/2; }
+  })(0);
+  const L = Math.max(1, leaf-1);
+  for (const nd of nodes){ nd.nx = nd.ux/L; nd.ny = maxD ? nd.depth/maxD : 0; }
+  nodes.leaves = leaf; nodes.maxDepth = maxD;
+  return nodes;
+}
+
+/* ------------------------- simulation ----------------------- */
+class Sim {
+  constructor(seed){
+    this.nodes = buildTree(NDIRS, seed);
+    this.N = NTHREADS;
+    this.threads = [];
+    for (let i=0;i<this.N;i++)
+      this.threads.push({id:i, waiting:[], claimed:[], state:"idle", cur:null,
+                         phase:"", t:0, dur:0, nextQueue:i, stealFrom:i,
+                         stealTimer:i*0.05, claimFlash:0, flash:0,
+                         done:0, ent:0, stole:0});
+    this.flying = []; this.arcs = [];
+    this.incomplete = 0; this.time = 0; this.steals = 0; this.stealsC = 0;
+    this.dirsDone = 0; this.entDone = 0; this.idxDirs = 0; this.finished = false;
+    this.caption = null;
+
+    this.enqueue(null, 0);
+    this.say("The root directory is handed to thread T0",
+             "main() calls QPTPool_enqueue(root) — every other thread starts with nothing", "sys", 4);
+  }
+
+  say(text, sub, kind, prio){
+    if (this.caption && prio < this.caption.prio && this.time - this.caption.t < 2.4) return;
+    this.caption = {text, sub, kind, prio, t:this.time};
+  }
+
+  /* QPTPool_enqueue(): push to the pushing thread's next_queue, round robin */
+  enqueue(src, nodeId){
+    let target;
+    if (src === null) target = 0;
+    else { target = src.nextQueue; src.nextQueue = (src.nextQueue+1) % this.N; }
+    this.nodes[nodeId].state = "queued";
+    this.incomplete++;
+    this.flying.push({node:nodeId, target, t:0, dur:T_FLY, kind:"enqueue",
+                      from: src ? src.id : -1});
+  }
+
+  /* steal(): max(size/2,1) items from the FRONT of a neighbour's queue */
+  trySteal(th){
+    for (const which of ["waiting","claimed"]){
+      for (let i=0;i<this.N;i++){
+        const c = (th.stealFrom+i) % this.N;
+        if (c === th.id) continue;
+        const v = this.threads[c], q = v[which];
+        if (!q.length) continue;
+        const take = Math.max(Math.floor(q.length/2), 1);
+        const items = which === "waiting" ? q.splice(0, take)
+                                          : q.splice(q.length-take, take);
+        this.arcs.push({from:c, to:th.id, t:0, dur:1.5, which});
+        items.forEach((n,k)=> this.flying.push({node:n, target:th.id, t:-k*0.12,
+                        dur:T_FLY*0.9, kind:"steal", from:c, which}));
+        v.flash = 1; th.flash = 1; th.stole += items.length;
+        th.stealFrom = (th.stealFrom+1) % this.N;
+        if (which === "waiting"){
+          this.steals++;
+          this.say(`T${th.id} ran out of work → stole ${items.length} item${items.length>1?"s":""} from T${c}`,
+                   `steal(): take half of a neighbour's WAITING queue, from the front`, "steal", 8);
+        } else {
+          this.stealsC++;
+          this.say(`Every waiting queue was empty → T${th.id} stole from T${c}'s CLAIMED queue`,
+                   `steal_claimed(): the rare anti-starvation path`, "steal2", 9);
+        }
+        return true;
+      }
+    }
+    th.stealFrom = (th.stealFrom+1) % this.N;
+    return false;
+  }
+
+  startWork(th, id){
+    const n = this.nodes[id];
+    n.state = "processing"; n.owner = th.id;
+    th.cur = id; th.state = "processing"; th.phase = "open"; th.t = 0; th.dur = T_OPEN;
+    th.emitted = 0;
+    th.descendDur = Math.max(1.3, n.kids.length * T_PER_KID);
+    th.dbDur = n.files * T_PER_FILE + T_COMMIT;
+    this.say(`T${th.id} opens ${n.name}`,
+             `processdir(): opendir + mkdir in the index + copy the db.db template`, "work", 1);
+  }
+
+  step(dt){
+    this.time += dt;
+
+    for (let i=this.flying.length-1;i>=0;i--){
+      const f = this.flying[i]; f.t += dt;
+      if (f.t >= f.dur){ this.threads[f.target].waiting.push(f.node); this.flying.splice(i,1); }
+    }
+    for (let i=this.arcs.length-1;i>=0;i--){ const a=this.arcs[i]; a.t+=dt; if (a.t>=a.dur) this.arcs.splice(i,1); }
+    for (const n of this.nodes){
+      if (n.pop>0)    n.pop    = Math.max(0, n.pop    - dt*1.0);
+      if (n.idxPop>0) n.idxPop = Math.max(0, n.idxPop - dt*1.0);
+    }
+
+    for (const th of this.threads){
+      th.flash = Math.max(0, th.flash - dt*0.7);
+      th.claimFlash = Math.max(0, th.claimFlash - dt*0.6);
+
+      if (th.state === "idle"){
+        if (th.claimed.length){
+          this.startWork(th, th.claimed.shift());
+        }
+        else if (th.waiting.length){
+          /* claim_work(): the whole waiting queue moves into claimed in one
+             atomic splice, then the front item is popped and executed */
+          const n = th.waiting.length;
+          for (const w of th.waiting) th.claimed.push(w);
+          th.waiting.length = 0; th.claimFlash = 1;
+          if (n > 1) this.say(`T${th.id} claims all ${n} items in its waiting queue at once`,
+                              `claim_work(): one lock, the entire queue moves WAITING → CLAIMED`, "claim", 6);
+          this.startWork(th, th.claimed.shift());
+        }
+        else if (this.incomplete > 0){
+          th.stealTimer -= dt;
+          if (th.stealTimer <= 0){ th.stealTimer = STEAL_TRY; this.trySteal(th); }
+        }
+        continue;
+      }
+
+      if (th.state === "processing"){
+        const n = this.nodes[th.cur];
+        th.t += dt;
+
+        if (th.phase === "open" && th.t >= th.dur){
+          /* mkdir in the index + byte-copy of the db.db template: the
+             directory now EXISTS in the destination tree, still empty */
+          n.idx = "created"; n.idxPop = 1; this.idxDirs++;
+          th.phase = "descend"; th.t = 0; th.dur = th.descendDur; th.emitted = 0;
+          if (n.kids.length)
+            this.say(`T${th.id} reads ${n.name}: ${n.kids.length} subdirectories go into the pool`,
+                     `descend(): each subdirectory is enqueued round-robin to a thread's waiting queue`, "descend", 5);
+          else
+            this.say(`T${th.id} reads ${n.name}: no subdirectories`,
+                     `descend(): only files here — nothing new is enqueued`, "descend", 3);
+        }
+        else if (th.phase === "descend"){
+          const want = n.kids.length ? Math.min(n.kids.length, Math.floor(th.t/T_PER_KID)+1) : 0;
+          while (th.emitted < want){ this.enqueue(th, n.kids[th.emitted]); th.emitted++; }
+          if (th.t >= th.dur){
+            while (th.emitted < n.kids.length){ this.enqueue(th, n.kids[th.emitted]); th.emitted++; }
+            th.phase = "db"; th.t = 0; th.dur = th.dbDur;
+            this.say(`T${th.id} writes ${n.files} entries into ${n.name}/db.db`,
+                     `files and links are NOT queued — they go straight into this directory's transaction`, "db", 4);
+          }
+        }
+        else if (th.phase === "db" && th.t >= th.dur){
+          n.state = "done"; n.pop = 1;
+          n.idx = "written"; n.idxPop = 1;          // entries + summary committed
+          this.dirsDone++; this.entDone += n.files;
+          th.done++; th.ent += n.files; th.cur = null;
+          this.incomplete--;
+          if (th.claimed.length) this.startWork(th, th.claimed.shift());
+          else th.state = "idle";
+        }
+      }
+    }
+
+    if (!this.finished && this.incomplete === 0 && !this.flying.length){
+      this.finished = true;
+      this.say(`Scan complete — the index holds ${this.dirsDone} db.db files, ${this.entDone} entries`,
+               `the pool drains when incomplete == 0, then every thread exits`, "sys", 10);
+    }
+  }
+}
+
+/* --------------------------- render -------------------------- */
+const cv = document.getElementById("c"), g = cv.getContext("2d");
+let W=0,H=0;
+function resize(){
+  const dpr = Math.min(2, devicePixelRatio||1), r = cv.getBoundingClientRect();
+  W=r.width; H=r.height; cv.width=Math.round(W*dpr); cv.height=Math.round(H*dpr);
+  g.setTransform(dpr,0,0,dpr,0,0);
+}
+
+let L = {};
+function computeLayout(sim){
+  const pad = 16, capH = 88, gapV = 12;
+  L.cap = {x:pad, y:pad, w:W-pad*2, h:capH};
+  const bodyY = pad + capH + 12, bodyH = H - bodyY - pad;
+  const splitX = Math.round(W*0.44);
+
+  const leftW = splitX - pad*1.5, halfH = (bodyH - gapV)/2;
+  L.src  = {x:pad, y:bodyY,            w:leftW, h:halfH};
+  L.dst  = {x:pad, y:bodyY+halfH+gapV, w:leftW, h:halfH};
+  L.pool = {x:splitX+pad*0.5, y:bodyY, w:W-pad-(splitX+pad*0.5), h:bodyH};
+
+  for (const P of [L.src, L.dst]){
+    P.ix = P.x + 40; P.iw = P.w - 80;
+    // the index tree carries a second label line under each node
+    P.iy = P.y + 62; P.ih = P.h - 62 - (P === L.dst ? 74 : 58);
+  }
+  const spacing = L.src.iw / Math.max(1, sim.nodes.leaves - 1);
+  const rowGap  = L.src.ih / Math.max(1, sim.nodes.maxDepth);
+  L.R = clamp(Math.min(21, spacing*0.44, rowGap*0.34), 11, 21);
+  for (const n of sim.nodes){
+    n.x  = L.src.ix + n.nx*L.src.iw;  n.y  = L.src.iy + n.ny*L.src.ih;
+    n.ix = L.dst.ix + n.nx*L.dst.iw;  n.iy = L.dst.iy + n.ny*L.dst.ih;
+  }
+
+  const p = L.pool, headH = 44, gap = 12;
+  const laneH = (p.h - headH - gap*(sim.N-1) - 8) / sim.N;
+  L.lanes = [];
+  for (let i=0;i<sim.N;i++) L.lanes.push({x:p.x, y:p.y+headH+i*(laneH+gap), w:p.w, h:laneH});
+  L.chipW = 54; L.chipH = 24;
+}
+
+function fitText(txt,x,y,maxW){
+  if (g.measureText(txt).width <= maxW){ g.fillText(txt,x,y); return; }
+  let t = txt;
+  while (t.length>1 && g.measureText(t+"…").width > maxW) t = t.slice(0,-1);
+  g.fillText(t+"…",x,y);
+}
+
+function panel(P,title,sub){
+  roundRect(g,P.x,P.y,P.w,P.h,12); g.fillStyle="#0e1420"; g.fill();
+  g.strokeStyle="#1c2740"; g.lineWidth=1; g.stroke();
+  g.fillStyle="#8ea0bd"; g.font="600 12px ui-monospace,monospace";
+  g.fillText(title, P.x+18, P.y+25);
+  if (sub){
+    const off = P.x+18+g.measureText(title).width+16;
+    g.fillStyle="#57678a"; g.font="11px ui-monospace,monospace";
+    fitText(sub, off, P.y+25, P.x+P.w-18-off);
+  }
+}
+
+function legend(P, items){
+  let x = P.x+18; const y = P.y+P.h-14;
+  g.font="10px ui-monospace,monospace";
+  for (const [txt,fill,edge] of items){
+    g.beginPath(); g.arc(x+5,y-4,5,0,7); g.fillStyle=fill; g.fill();
+    g.strokeStyle=edge||"#39496a"; g.lineWidth=1; g.stroke();
+    g.fillStyle="#6c7c98"; g.fillText(txt, x+15, y);
+    x += 15 + g.measureText(txt).width + 16;
+  }
+}
+
+/* ---- source tree: the filesystem being walked ---- */
+function drawSourceTree(sim){
+  panel(L.src, "SOURCE TREE",
+        "the filesystem being walked · 1 directory = 1 work item · Nf = files inside");
+  const R = L.R;
+
+  g.lineWidth = 1.4;
+  for (const n of sim.nodes){
+    if (n.parent < 0) continue;
+    const p = sim.nodes[n.parent];
+    g.strokeStyle = n.state === "undiscovered" ? "#1b2434" : "#2c3f5f";
+    g.beginPath(); g.moveTo(p.x,p.y);
+    g.bezierCurveTo(p.x,(p.y+n.y)/2, n.x,(p.y+n.y)/2, n.x,n.y); g.stroke();
+  }
+
+  for (const n of sim.nodes){
+    if (n.state === "processing"){
+      g.beginPath(); g.arc(n.x,n.y,R+10+Math.sin(sim.time*4)*2,0,7);
+      g.strokeStyle = THREAD_COLORS[n.owner]+"55"; g.lineWidth=3.5; g.stroke();
+    }
+    if (n.pop > 0){
+      g.beginPath(); g.arc(n.x,n.y,R+(1-n.pop)*26,0,7);
+      g.strokeStyle = `rgba(62,224,176,${n.pop*0.6})`; g.lineWidth=2; g.stroke();
+    }
+    g.beginPath(); g.arc(n.x,n.y,R,0,7);
+    g.fillStyle = n.state==="undiscovered" ? "#1a2334"
+                : n.state==="queued"       ? C_QUEUED
+                : n.state==="processing"   ? THREAD_COLORS[n.owner] : C_DONE;
+    g.fill();
+    g.strokeStyle = n.state==="processing" ? "#ffffff"
+                  : n.state==="done"       ? C_DONE_E : "#2b3852";
+    g.lineWidth = n.state==="processing" ? 2.5 : 1.4; g.stroke();
+
+    /* name + how many files/links this directory holds, both inside the circle */
+    const roomy = R >= 15;
+    g.textAlign="center";
+    g.font="600 12px ui-monospace,monospace";
+    g.fillStyle = n.state==="undiscovered" ? "#4a5876" : "#0a0e15";
+    g.fillText(n.name.replace("/data","/"), n.x, roomy ? n.y-1 : n.y+4);
+    if (roomy){
+      g.font="600 10px ui-monospace,monospace";
+      g.fillStyle = n.state==="undiscovered" ? "#3d4863" : "rgba(10,14,21,0.62)";
+      g.fillText(n.files+"f", n.x, n.y+11);
+    }
+    g.textAlign="left";
+  }
+
+  legend(L.src, [["not seen","#1a2334"],["queued",C_QUEUED],
+                 ["scanning","#ffffff"],["scanned",C_DONE,C_DONE_E]]);
+}
+
+/* ---- destination tree: the GUFI index, built as the scan runs ---- */
+function drawIndexTree(sim){
+  panel(L.dst, "GUFI INDEX TREE (destination)",
+        `built as the scan runs · ${sim.dirsDone}/${sim.nodes.length} db.db written`);
+  const R = L.R;
+
+  g.lineWidth = 1.4;
+  for (const n of sim.nodes){
+    if (n.parent < 0 || n.idx === "none") continue;
+    const p = sim.nodes[n.parent];
+    if (p.idx === "none") continue;
+    g.strokeStyle = "#243c56";
+    g.beginPath(); g.moveTo(p.ix,p.iy);
+    g.bezierCurveTo(p.ix,(p.iy+n.iy)/2, n.ix,(p.iy+n.iy)/2, n.ix,n.iy); g.stroke();
+  }
+
+  for (const n of sim.nodes){
+    if (n.idx === "none"){
+      g.beginPath(); g.arc(n.ix,n.iy,3.5,0,7);
+      g.fillStyle = "#161e2c"; g.fill();
+      continue;
+    }
+    const written = n.idx === "written";
+    if (n.idxPop > 0){
+      g.beginPath(); g.arc(n.ix,n.iy,R+(1-n.idxPop)*24,0,7);
+      g.strokeStyle = written ? `rgba(62,224,176,${n.idxPop*0.7})`
+                              : `rgba(90,169,255,${n.idxPop*0.55})`;
+      g.lineWidth=2; g.stroke();
+    }
+    g.beginPath(); g.arc(n.ix,n.iy,R,0,7);
+    g.fillStyle   = written ? C_DONE : "#15202f"; g.fill();
+    g.strokeStyle = written ? C_DONE_E : "#3f6da8"; g.lineWidth = 1.6; g.stroke();
+
+    g.textAlign="center"; g.font="600 12px ui-monospace,monospace";
+    g.fillStyle = written ? "#0a0e15" : "#7fa8d8";
+    g.fillText(n.name.replace("/data","/"), n.ix, n.iy+4);
+    g.font="10px ui-monospace,monospace";
+    g.fillStyle = written ? "#4f7f74" : "#4a6488";
+    g.fillText(written ? n.files+" ent" : "empty", n.ix, n.iy+R+14);
+    g.textAlign="left";
+  }
+
+  legend(L.dst, [["not created yet","#161e2c"],
+                 ["db.db copied from template","#15202f","#3f6da8"],
+                 ["entries + summary written",C_DONE,C_DONE_E]]);
+}
+
+function chipPos(i, which, idx){
+  const ln = L.lanes[i];
+  const x0 = ln.x + RAIL_X;
+  const y  = which==="waiting" ? ln.y + ln.h*0.34 : ln.y + ln.h*0.72;
+  return {x: x0 + idx*(L.chipW+6), y: y - L.chipH/2};
+}
+
+function drawChip(x,y,label,fill,stroke,textCol){
+  roundRect(g,x,y,L.chipW,L.chipH,5);
+  g.fillStyle=fill; g.fill(); g.strokeStyle=stroke; g.lineWidth=1.4; g.stroke();
+  g.textAlign="center"; g.font="600 11px ui-monospace,monospace"; g.fillStyle=textCol;
+  g.fillText(label, x+L.chipW/2, y+L.chipH/2+4); g.textAlign="left";
+}
+
+function drawPool(sim){
+  panel(L.pool, "THREAD POOL",
+        `${sim.N} threads, each with its own waiting + claimed queue`);
+
+  for (let i=0;i<sim.N;i++){
+    const th = sim.threads[i], ln = L.lanes[i], col = THREAD_COLORS[i];
+
+    roundRect(g, ln.x, ln.y, ln.w, ln.h, 10);
+    g.fillStyle = th.state==="processing" ? "#131c2c" : "#101724"; g.fill();
+    g.strokeStyle = th.flash>0 ? `rgba(255,122,184,${0.3+th.flash*0.7})` : "#1d2840";
+    g.lineWidth = th.flash>0 ? 2 : 1; g.stroke();
+
+    const cy = ln.y + ln.h/2;
+    g.beginPath(); g.arc(ln.x+40, cy, 21, 0, 7);
+    g.fillStyle = th.state==="idle" ? "#161f31" : col+"22"; g.fill();
+    g.strokeStyle = col; g.lineWidth = th.state==="processing" ? 2.5 : 1.4; g.stroke();
+    g.textAlign="center"; g.font="600 15px ui-monospace,monospace"; g.fillStyle=col;
+    g.fillText("T"+i, ln.x+40, cy+5); g.textAlign="left";
+
+    const tx = ln.x+72, maxTW = RAIL_X - 72 - 74;
+    if (th.state === "processing"){
+      const n = sim.nodes[th.cur];
+      const ph = th.phase==="open" ? "opening + creating db.db"
+               : th.phase==="descend" ? "reading entries"
+               : "writing "+n.files+" entries";
+      g.font="600 13px ui-monospace,monospace"; g.fillStyle=col;
+      fitText(n.name, tx, cy-8, maxTW);
+      g.font="10px ui-monospace,monospace"; g.fillStyle="#8294b2";
+      fitText(ph, tx, cy+8, maxTW);
+      const tot = T_OPEN+th.descendDur+th.dbDur;
+      const el = th.phase==="open" ? th.t : th.phase==="descend" ? T_OPEN+th.t : T_OPEN+th.descendDur+th.t;
+      g.fillStyle="#1a2437"; roundRect(g,tx,cy+16,104,5,2.5); g.fill();
+      g.fillStyle=col; roundRect(g,tx,cy+16,104*clamp(el/tot,0,1),5,2.5); g.fill();
+    } else {
+      g.font="600 12px ui-monospace,monospace";
+      g.fillStyle = sim.incomplete>0 ? C_STEAL : "#4a5771";
+      g.fillText(sim.incomplete>0 ? "idle → stealing" : "exited", tx, cy-2);
+      g.font="10px ui-monospace,monospace"; g.fillStyle="#5b6a86";
+      g.fillText(`${th.done} dirs done`, tx, cy+14);
+    }
+
+    drawQueue(sim, i, th, "waiting", col);
+    drawQueue(sim, i, th, "claimed", col);
+  }
+}
+
+function drawQueue(sim, i, th, which, col){
+  const arr = th[which], ln = L.lanes[i];
+  const p0 = chipPos(i, which, 0);
+  const railW = ln.w - RAIL_X - 16;
+
+  g.fillStyle = "#0b111c";
+  roundRect(g, p0.x-7, p0.y-6, railW, L.chipH+12, 6); g.fill();
+  if (which==="claimed" && th.claimFlash>0){
+    g.strokeStyle = `rgba(255,194,71,${th.claimFlash})`; g.lineWidth=1.6; g.stroke();
+  }
+
+  g.font="11px ui-monospace,monospace"; g.textAlign="right";
+  g.fillStyle = which==="claimed" && th.claimFlash>0 ? "#ffc247" : "#61728f";
+  g.fillText(which, p0.x-16, p0.y+L.chipH/2+4);
+  g.textAlign="left";
+
+  const max = Math.max(1, Math.floor((railW-24)/(L.chipW+6)));
+  const shown = Math.min(arr.length, max);
+  for (let k=0;k<shown;k++){
+    const pos = chipPos(i, which, k), n = sim.nodes[arr[k]];
+    if (which === "waiting") drawChip(pos.x,pos.y,n.name,"#16243c",C_QUEUED,"#a9c3e8");
+    else                     drawChip(pos.x,pos.y,n.name,col+"33",col,"#e6eefc");
+  }
+  if (arr.length > shown){
+    const pos = chipPos(i, which, shown);
+    g.font="11px ui-monospace,monospace"; g.fillStyle="#6c7c98";
+    g.fillText("+"+(arr.length-shown), pos.x+2, pos.y+17);
+  }
+}
+
+function drawFlying(sim){
+  for (const f of sim.flying){
+    if (f.t < 0) continue;
+    const n = sim.nodes[f.node], th = sim.threads[f.target];
+    const dst = chipPos(f.target, "waiting", Math.min(th.waiting.length, 6));
+    let sx, sy;
+    if (f.kind === "steal"){
+      const s = L.lanes[f.from];
+      sx = s.x + RAIL_X + 34; sy = s.y + s.h*(f.which==="waiting"?0.34:0.72);
+    } else {
+      const src = n.parent>=0 ? sim.nodes[n.parent] : n;
+      sx = src.x; sy = src.y;
+    }
+    const tx = dst.x + L.chipW/2, ty = dst.y + L.chipH/2;
+    const u = easeInOut(clamp(f.t/f.dur,0,1));
+    const mx = (sx+tx)/2, my = (sy+ty)/2 + (f.kind==="steal" ? -90 : -70);
+    const x = (1-u)*(1-u)*sx + 2*(1-u)*u*mx + u*u*tx;
+    const y = (1-u)*(1-u)*sy + 2*(1-u)*u*my + u*u*ty;
+
+    g.strokeStyle = f.kind==="steal" ? "rgba(255,122,184,0.28)" : "rgba(90,169,255,0.22)";
+    g.lineWidth = 1.5; g.setLineDash([4,4]);
+    g.beginPath(); g.moveTo(sx,sy); g.quadraticCurveTo(mx,my,x,y); g.stroke();
+    g.setLineDash([]);
+
+    g.save(); g.shadowColor="rgba(0,0,0,0.85)"; g.shadowBlur=14;
+    drawChip(x-L.chipW/2, y-L.chipH/2, n.name,
+             f.kind==="steal" ? "#3a1a2c" : "#132842",
+             f.kind==="steal" ? C_STEAL : "#5aa9ff", "#ffffff");
+    g.restore();
+  }
+}
+
+function drawArcs(sim){
+  for (const a of sim.arcs){
+    const A = L.lanes[a.from], B = L.lanes[a.to];
+    const u = clamp(a.t/a.dur,0,1), alpha = (1-u)*0.9;
+    const ax = A.x + A.w - 26, ay = A.y + A.h/2;
+    const bx = B.x + B.w - 26, by = B.y + B.h/2;
+    const col = a.which==="waiting" ? `rgba(255,122,184,${alpha})` : `rgba(255,194,71,${alpha})`;
+    g.save(); g.setLineDash([6,5]); g.lineDashOffset = -sim.time*30;
+    g.strokeStyle = col; g.lineWidth = 2.2;
+    g.beginPath(); g.moveTo(ax,ay); g.quadraticCurveTo(ax+22,(ay+by)/2,bx,by); g.stroke();
+    g.restore();
+    g.fillStyle = col; g.font="600 11px ui-monospace,monospace"; g.textAlign="right";
+    g.fillText(a.which==="waiting" ? "steals ½" : "steals from claimed", ax-10, (ay+by)/2+4);
+    g.textAlign="left";
+  }
+}
+
+function drawCaption(sim){
+  const c = L.cap;
+  const kind = sim.caption ? sim.caption.kind : "sys";
+  const accent = kind==="steal" ? C_STEAL : kind==="steal2" ? "#ffc247"
+               : kind==="claim" ? "#ffc247" : kind==="descend" ? "#5aa9ff"
+               : kind==="db" ? "#3ddc97" : "#8ea0bd";
+
+  roundRect(g,c.x,c.y,c.w,c.h,12);
+  g.fillStyle = "#101827"; g.fill();
+  g.strokeStyle = accent+"55"; g.lineWidth=1.5; g.stroke();
+  roundRect(g,c.x,c.y,7,c.h,12); g.fillStyle = accent; g.fill();
+
+  if (sim.caption){
+    const fade = clamp((sim.time - sim.caption.t)/0.25, 0, 1);
+    g.globalAlpha = 0.3 + 0.7*fade;
+    g.font = "600 25px ui-monospace,monospace"; g.fillStyle = "#f2f7ff";
+    fitText(sim.caption.text, c.x+28, c.y+38, c.w-56);
+    g.font = "15px ui-monospace,monospace"; g.fillStyle = accent;
+    fitText(sim.caption.sub, c.x+28, c.y+66, c.w-56);
+    g.globalAlpha = 1;
+  }
+}
+
+/* ----------------------------- app --------------------------- */
+let sim, playing = true, speed = 1, seed = 11;
+const params = new URLSearchParams(location.search);
+
+function newSim(){
+  sim = new Sim(seed);
+  const skip = parseFloat(params.get("skip")||"0");
+  for (let k=0;k<skip*60;k++) sim.step(1/60);
+}
+
+let last = performance.now(), lastW=0, lastH=0;
+function frame(now){
+  const raw = Math.min(0.05, (now-last)/1000); last = now;
+  const r = cv.getBoundingClientRect();
+  if (Math.abs(r.width-lastW)>0.5 || Math.abs(r.height-lastH)>0.5){ lastW=r.width; lastH=r.height; resize(); }
+  computeLayout(sim);
+  if (playing){ let d = raw*speed; while (d>0){ const s = Math.min(1/120, d); sim.step(s); d -= s; } }
+
+  g.fillStyle = "#0a0e15"; g.fillRect(0,0,W,H);
+  drawCaption(sim);
+  drawSourceTree(sim); drawIndexTree(sim);
+  drawPool(sim); drawArcs(sim); drawFlying(sim);
+  requestAnimationFrame(frame);
+}
+
+document.getElementById("play").onclick = e => {
+  playing = !playing; e.target.textContent = playing ? "⏸ Pause" : "▶ Play";
+};
+document.getElementById("speed").onchange = e => speed = parseFloat(e.target.value);
+document.getElementById("reset").onclick = () => { seed++; newSim(); };
+addEventListener("keydown", e => {
+  if (e.code === "Space"){ e.preventDefault(); document.getElementById("play").click(); }
+  if (e.key === "r"){ seed++; newSim(); }
+});
+
+resize(); newSim(); requestAnimationFrame(frame);
+</script>
+</body>
+</html>
