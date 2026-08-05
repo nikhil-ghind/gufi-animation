@@ -42,7 +42,15 @@ Flying chips are work items in transit: **blue** = a subdirectory being enqueued
    queue instead. The start (only T0 has the root) and the end (threads fight over the last
    directories) are where stealing shows up most.
 
-Controls: **speed** (0.25×–2×), **Pause**, **Restart** (or `space` / `r`).
+Controls: **threads** (2–16), **speed** (0.25×–2×), **Pause**, **Restart** (or `space` / `r`).
+
+Changing the thread count restarts on the *same* tree, so only the scheduling differs — run 2
+then 16 back to back and the queues, the round-robin spread, and how much stealing happens are
+the only things that change. The tree size is fixed at 22 directories, so at 16 threads most
+threads spend the run stealing; that starvation is the point, not a bug.
+
+The controls can also be preset from the URL, which is handy for a live demo:
+`?threads=8`, `?skip=20` (fast-forward N seconds before drawing).
 Restart generates a new random tree.
 
 ## Fidelity

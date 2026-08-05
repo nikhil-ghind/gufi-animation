@@ -28,6 +28,17 @@
   <header>
     <h1>GUFI full scan <span>— one directory = one work item · queue per thread · work stealing</span></h1>
     <div class="sp">
+      <span class="spd">threads
+        <select id="threads">
+          <option value="2">2</option>
+          <option value="3">3</option>
+          <option value="4" selected>4</option>
+          <option value="6">6</option>
+          <option value="8">8</option>
+          <option value="12">12</option>
+          <option value="16">16</option>
+        </select>
+      </span>
       <span class="spd">speed
         <select id="speed">
           <option value="0.25">0.25×</option>
@@ -51,8 +62,8 @@
    Models src/gufi_dir2index.c, src/descend.c, src/QueuePerThreadPool.c
    ============================================================= */
 
-const NTHREADS = 4;
-const NDIRS    = 22;
+let   NTHREADS = 4;      // set from the header control / ?threads=
+const NDIRS    = 22;     // fixed, so changing the thread count compares like with like
 
 /* slow, readable timings (seconds at 1x) */
 const T_FLY      = 1.85;   // a work item travelling to a queue
@@ -68,7 +79,20 @@ const easeInOut=t=>t<.5?2*t*t:1-Math.pow(-2*t+2,2)/2;
 function roundRect(g,x,y,w,h,r){r=Math.min(r,w/2,h/2);g.beginPath();g.moveTo(x+r,y);
   g.arcTo(x+w,y,x+w,y+h,r);g.arcTo(x+w,y+h,x,y+h,r);g.arcTo(x,y+h,x,y,r);g.arcTo(x,y,x+w,y,r);g.closePath();}
 
-const THREAD_COLORS = ["#5aa9ff","#ff7ab8","#ffc247","#a78bfa"];
+/* the first four are hand-picked; beyond that hues walk by the golden angle so any
+   thread count stays distinguishable. Always hex — callers append "22"/"55" alpha. */
+const BASE_COLORS = ["#5aa9ff","#ff7ab8","#ffc247","#a78bfa"];
+const _tcol = BASE_COLORS.slice();
+function hsl2hex(h,s,l){
+  const a = s*Math.min(l,1-l);
+  const f = n => { const k=(n+h/30)%12, c=l-a*Math.max(-1,Math.min(k-3,9-k,1));
+                   return Math.round(255*c).toString(16).padStart(2,"0"); };
+  return "#"+f(0)+f(8)+f(4);
+}
+function tcol(i){
+  if (!_tcol[i]) _tcol[i] = hsl2hex((i*137.508+188)%360, 0.74, 0.66);
+  return _tcol[i];
+}
 const C_QUEUED = "#4a6ea8";
 const C_DONE   = "#1f7d63";
 const C_DONE_E = "#3ee0b0";
@@ -311,11 +335,21 @@ function computeLayout(sim){
     n.ix = L.dst.ix + n.nx*L.dst.iw;  n.iy = L.dst.iy + n.ny*L.dst.ih;
   }
 
-  const p = L.pool, headH = 44, gap = 12;
-  const laneH = (p.h - headH - gap*(sim.N-1) - 8) / sim.N;
+  const p = L.pool, headH = 44, gap = sim.N > 8 ? 6 : 12;
+  const avail = p.h - headH - gap*(sim.N-1) - 8;
+  const laneH = Math.min(150, avail / sim.N);        // capped, so 2 lanes don't balloon
+  const top   = p.y + headH + (avail - laneH*sim.N)/2;
   L.lanes = [];
-  for (let i=0;i<sim.N;i++) L.lanes.push({x:p.x, y:p.y+headH+i*(laneH+gap), w:p.w, h:laneH});
-  L.chipW = 54; L.chipH = 24;
+  for (let i=0;i<sim.N;i++) L.lanes.push({x:p.x, y:top+i*(laneH+gap), w:p.w, h:laneH});
+
+  /* lane internals scale with the lane, so 16 threads still fit the same panel */
+  L.laneH = laneH;
+  L.tight = laneH < 92;                          // drop the phase caption, thin the bars
+  L.chipH = clamp(laneH*0.26, 14, 24);
+  L.chipW = L.chipH >= 21 ? 54 : 46;
+  L.tR    = clamp(laneH*0.22, 10, 21);           // thread badge radius
+  L.railX = L.tight ? 250 : RAIL_X;              // rails start earlier when text is smaller
+  L.railPad = L.tight ? 2 : 6;                   // keeps the two rails from touching
 }
 
 function fitText(txt,x,y,maxW){
@@ -366,7 +400,7 @@ function drawSourceTree(sim){
   for (const n of sim.nodes){
     if (n.state === "processing"){
       g.beginPath(); g.arc(n.x,n.y,R+10+Math.sin(sim.time*4)*2,0,7);
-      g.strokeStyle = THREAD_COLORS[n.owner]+"55"; g.lineWidth=3.5; g.stroke();
+      g.strokeStyle = tcol(n.owner)+"55"; g.lineWidth=3.5; g.stroke();
     }
     if (n.pop > 0){
       g.beginPath(); g.arc(n.x,n.y,R+(1-n.pop)*26,0,7);
@@ -375,7 +409,7 @@ function drawSourceTree(sim){
     g.beginPath(); g.arc(n.x,n.y,R,0,7);
     g.fillStyle = n.state==="undiscovered" ? "#1a2334"
                 : n.state==="queued"       ? C_QUEUED
-                : n.state==="processing"   ? THREAD_COLORS[n.owner] : C_DONE;
+                : n.state==="processing"   ? tcol(n.owner) : C_DONE;
     g.fill();
     g.strokeStyle = n.state==="processing" ? "#ffffff"
                   : n.state==="done"       ? C_DONE_E : "#2b3852";
@@ -448,16 +482,18 @@ function drawIndexTree(sim){
 
 function chipPos(i, which, idx){
   const ln = L.lanes[i];
-  const x0 = ln.x + RAIL_X;
-  const y  = which==="waiting" ? ln.y + ln.h*0.34 : ln.y + ln.h*0.72;
+  const x0 = ln.x + L.railX;
+  const y  = which==="waiting" ? ln.y + ln.h*(L.tight?0.29:0.34)
+                               : ln.y + ln.h*(L.tight?0.75:0.72);
   return {x: x0 + idx*(L.chipW+6), y: y - L.chipH/2};
 }
 
 function drawChip(x,y,label,fill,stroke,textCol){
   roundRect(g,x,y,L.chipW,L.chipH,5);
   g.fillStyle=fill; g.fill(); g.strokeStyle=stroke; g.lineWidth=1.4; g.stroke();
-  g.textAlign="center"; g.font="600 11px ui-monospace,monospace"; g.fillStyle=textCol;
-  g.fillText(label, x+L.chipW/2, y+L.chipH/2+4); g.textAlign="left";
+  g.textAlign="center"; g.font=`600 ${L.chipH>=21?11:10}px ui-monospace,monospace`;
+  g.fillStyle=textCol;
+  g.fillText(label, x+L.chipW/2, y+L.chipH/2+3.5); g.textAlign="left";
 }
 
 function drawPool(sim){
@@ -465,34 +501,49 @@ function drawPool(sim){
         `${sim.N} threads, each with its own waiting + claimed queue`);
 
   for (let i=0;i<sim.N;i++){
-    const th = sim.threads[i], ln = L.lanes[i], col = THREAD_COLORS[i];
+    const th = sim.threads[i], ln = L.lanes[i], col = tcol(i);
 
     roundRect(g, ln.x, ln.y, ln.w, ln.h, 10);
     g.fillStyle = th.state==="processing" ? "#131c2c" : "#101724"; g.fill();
     g.strokeStyle = th.flash>0 ? `rgba(255,122,184,${0.3+th.flash*0.7})` : "#1d2840";
     g.lineWidth = th.flash>0 ? 2 : 1; g.stroke();
 
-    const cy = ln.y + ln.h/2;
-    g.beginPath(); g.arc(ln.x+40, cy, 21, 0, 7);
+    const cy = ln.y + ln.h/2, R = L.tR, bx = ln.x + R + 18;
+    g.beginPath(); g.arc(bx, cy, R, 0, 7);
     g.fillStyle = th.state==="idle" ? "#161f31" : col+"22"; g.fill();
     g.strokeStyle = col; g.lineWidth = th.state==="processing" ? 2.5 : 1.4; g.stroke();
-    g.textAlign="center"; g.font="600 15px ui-monospace,monospace"; g.fillStyle=col;
-    g.fillText("T"+i, ln.x+40, cy+5); g.textAlign="left";
+    g.textAlign="center"; g.font=`600 ${L.tight?11:15}px ui-monospace,monospace`; g.fillStyle=col;
+    g.fillText("T"+i, bx, cy + (L.tight?4:5)); g.textAlign="left";
 
-    const tx = ln.x+72, maxTW = RAIL_X - 72 - 74;
+    /* reserve room before the rails for the "waiting"/"claimed" label */
+    const tx = bx + R + 12, maxTW = ln.x + L.railX - tx - (L.tight ? 46 : 74);
+    const barW = Math.min(104, Math.max(52, maxTW));
     if (th.state === "processing"){
       const n = sim.nodes[th.cur];
-      const ph = th.phase==="open" ? "opening + creating db.db"
-               : th.phase==="descend" ? "reading entries"
-               : "writing "+n.files+" entries";
-      g.font="600 13px ui-monospace,monospace"; g.fillStyle=col;
-      fitText(n.name, tx, cy-8, maxTW);
-      g.font="10px ui-monospace,monospace"; g.fillStyle="#8294b2";
-      fitText(ph, tx, cy+8, maxTW);
       const tot = T_OPEN+th.descendDur+th.dbDur;
       const el = th.phase==="open" ? th.t : th.phase==="descend" ? T_OPEN+th.t : T_OPEN+th.descendDur+th.t;
-      g.fillStyle="#1a2437"; roundRect(g,tx,cy+16,104,5,2.5); g.fill();
-      g.fillStyle=col; roundRect(g,tx,cy+16,104*clamp(el/tot,0,1),5,2.5); g.fill();
+      if (L.tight){
+        /* short lanes: name + bar only, the phase caption is dropped */
+        g.font="600 11px ui-monospace,monospace"; g.fillStyle=col;
+        fitText(n.name, tx, cy-3, maxTW);
+        g.fillStyle="#1a2437"; roundRect(g,tx,cy+4,barW,4,2); g.fill();
+        g.fillStyle=col; roundRect(g,tx,cy+4,barW*clamp(el/tot,0,1),4,2); g.fill();
+      } else {
+        const ph = th.phase==="open" ? "opening + creating db.db"
+                 : th.phase==="descend" ? "reading entries"
+                 : "writing "+n.files+" entries";
+        g.font="600 13px ui-monospace,monospace"; g.fillStyle=col;
+        fitText(n.name, tx, cy-8, maxTW);
+        g.font="10px ui-monospace,monospace"; g.fillStyle="#8294b2";
+        fitText(ph, tx, cy+8, maxTW);
+        g.fillStyle="#1a2437"; roundRect(g,tx,cy+16,barW,5,2.5); g.fill();
+        g.fillStyle=col; roundRect(g,tx,cy+16,barW*clamp(el/tot,0,1),5,2.5); g.fill();
+      }
+    } else if (L.tight){
+      g.font="600 11px ui-monospace,monospace";
+      g.fillStyle = sim.incomplete>0 ? C_STEAL : "#4a5771";
+      fitText(sim.incomplete>0 ? `stealing · ${th.done} done` : `exited · ${th.done} done`,
+              tx, cy+4, maxTW);
     } else {
       g.font="600 12px ui-monospace,monospace";
       g.fillStyle = sim.incomplete>0 ? C_STEAL : "#4a5771";
@@ -509,17 +560,18 @@ function drawPool(sim){
 function drawQueue(sim, i, th, which, col){
   const arr = th[which], ln = L.lanes[i];
   const p0 = chipPos(i, which, 0);
-  const railW = ln.w - RAIL_X - 16;
+  const railW = ln.w - L.railX - 16;
 
   g.fillStyle = "#0b111c";
-  roundRect(g, p0.x-7, p0.y-6, railW, L.chipH+12, 6); g.fill();
+  roundRect(g, p0.x-7, p0.y-L.railPad, railW, L.chipH+L.railPad*2, 6); g.fill();
   if (which==="claimed" && th.claimFlash>0){
     g.strokeStyle = `rgba(255,194,71,${th.claimFlash})`; g.lineWidth=1.6; g.stroke();
   }
 
-  g.font="11px ui-monospace,monospace"; g.textAlign="right";
+  g.font=`${L.tight?10:11}px ui-monospace,monospace`; g.textAlign="right";
   g.fillStyle = which==="claimed" && th.claimFlash>0 ? "#ffc247" : "#61728f";
-  g.fillText(which, p0.x-16, p0.y+L.chipH/2+4);
+  g.fillText(L.tight ? (which==="waiting"?"wait":"claim") : which,
+             p0.x-16, p0.y+L.chipH/2+3.5);
   g.textAlign="left";
 
   const max = Math.max(1, Math.floor((railW-24)/(L.chipW+6)));
@@ -544,7 +596,7 @@ function drawFlying(sim){
     let sx, sy;
     if (f.kind === "steal"){
       const s = L.lanes[f.from];
-      sx = s.x + RAIL_X + 34; sy = s.y + s.h*(f.which==="waiting"?0.34:0.72);
+      sx = s.x + L.railX + 34; sy = s.y + s.h*(f.which==="waiting"?0.34:0.72);
     } else {
       const src = n.parent>=0 ? sim.nodes[n.parent] : n;
       sx = src.x; sy = src.y;
@@ -638,6 +690,18 @@ document.getElementById("play").onclick = e => {
 };
 document.getElementById("speed").onchange = e => speed = parseFloat(e.target.value);
 document.getElementById("reset").onclick = () => { seed++; newSim(); };
+
+/* thread count: restart on the SAME seed, so the tree is identical and only the
+   scheduling changes — that is the comparison worth showing */
+const threadSel = document.getElementById("threads");
+const wantThreads = parseInt(params.get("threads")||"", 10);
+if (wantThreads >= 1 && wantThreads <= 16){
+  NTHREADS = wantThreads;
+  if (![...threadSel.options].some(o => +o.value === wantThreads))
+    threadSel.add(new Option(String(wantThreads), String(wantThreads)));
+  threadSel.value = String(wantThreads);
+}
+threadSel.onchange = e => { NTHREADS = parseInt(e.target.value,10); newSim(); };
 addEventListener("keydown", e => {
   if (e.code === "Space"){ e.preventDefault(); document.getElementById("play").click(); }
   if (e.key === "r"){ seed++; newSim(); }
