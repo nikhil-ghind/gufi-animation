@@ -15,27 +15,31 @@
          border-bottom:1px solid var(--line);background:#0d1320}
   h1{font-size:15px;margin:0;font-weight:600}
   h1 span{color:var(--dim);font-weight:400}
-  h1 a{color:#5aa9ff;text-decoration:none;font-weight:400;font-size:13px;margin-left:10px}
-  h1 a:hover{text-decoration:underline}
   .sp{margin-left:auto;display:flex;gap:10px;align-items:center}
   button,select{background:#182236;color:var(--text);border:1px solid var(--line);
          border-radius:7px;padding:7px 12px;font:inherit;cursor:pointer}
   button:hover,select:hover{background:#1f2b45}
   button.on{background:#24365a;border-color:#3f6da8;color:#cfe2ff}
   .spd{display:flex;align-items:center;gap:7px;color:var(--dim);font-size:13px}
-  .acts{display:flex;gap:6px;margin-right:6px}
+  .nav{display:flex;gap:6px}
+  .nav a{background:#182236;color:var(--dim);border:1px solid var(--line);border-radius:7px;
+         padding:6px 11px;font-size:13px;text-decoration:none;white-space:nowrap}
+  .nav a:hover{background:#1f2b45;color:var(--text)}
+  .nav a.on{background:#24365a;border-color:#3f6da8;color:#cfe2ff}
   canvas{display:block;flex:1;width:100%}
+  @media (max-width:1400px){ h1 span{display:none} }
 </style>
 </head>
 <body>
 <div id="app">
   <header>
-    <h1>GUFI <span id="subtitle">— rollup</span><a href="index.html">← full scan</a></h1>
+    <h1>GUFI <span id="subtitle">— rollup</span></h1>
+    <nav class="nav">
+      <a href="index.html">Full scan</a>
+      <a href="rollup_query.html" id="act1" class="on">Rollup</a>
+      <a href="rollup_query.html?act=2" id="act2">Query</a>
+    </nav>
     <div class="sp">
-      <span class="acts">
-        <button id="act1" class="on">① Rollup</button>
-        <button id="act2">② Query</button>
-      </span>
       <span class="spd">threads
         <select id="threads">
           <option value="2">2</option>
@@ -829,15 +833,22 @@ function frame(now){
   requestAnimationFrame(frame);
 }
 
-function setAct(a){ act = a; newSim(); }
+function setAct(a){
+  act = a; newSim();
+  const u = new URL(location.href);
+  if (a === 2) u.searchParams.set("act","2"); else u.searchParams.delete("act");
+  history.replaceState(null, "", u);
+}
 
 document.getElementById("play").onclick = e => {
   playing = !playing; e.target.textContent = playing ? "⏸ Pause" : "▶ Play";
 };
 document.getElementById("speed").onchange = e => speed = parseFloat(e.target.value);
 document.getElementById("reset").onclick = () => { seed++; newTree(); newSim(); };
-document.getElementById("act1").onclick = () => setAct(1);
-document.getElementById("act2").onclick = () => setAct(2);
+/* the act links are real hrefs so they can be opened in a new tab, but an
+   in-page click just switches acts and rewrites the URL to match */
+for (const [id, a] of [["act1",1],["act2",2]])
+  document.getElementById(id).onclick = e => { e.preventDefault(); setAct(a); };
 
 const threadSel = document.getElementById("threads");
 const wantThreads = parseInt(params.get("threads")||"", 10);

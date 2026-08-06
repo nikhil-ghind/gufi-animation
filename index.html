@@ -20,13 +20,24 @@
          border-radius:7px;padding:7px 12px;font:inherit;cursor:pointer}
   button:hover,select:hover{background:#1f2b45}
   .spd{display:flex;align-items:center;gap:7px;color:var(--dim);font-size:13px}
+  .nav{display:flex;gap:6px}
+  .nav a{background:#182236;color:var(--dim);border:1px solid var(--line);border-radius:7px;
+         padding:6px 11px;font-size:13px;text-decoration:none;white-space:nowrap}
+  .nav a:hover{background:#1f2b45;color:var(--text)}
+  .nav a.on{background:#24365a;border-color:#3f6da8;color:#cfe2ff}
   canvas{display:block;flex:1;width:100%}
+  @media (max-width:1400px){ h1 span{display:none} }
 </style>
 </head>
 <body>
 <div id="app">
   <header>
     <h1>GUFI full scan <span>— one directory = one work item · queue per thread · work stealing</span></h1>
+    <nav class="nav">
+      <a href="index.html" class="on">Full scan</a>
+      <a href="rollup_query.html">Rollup</a>
+      <a href="rollup_query.html?act=2">Query</a>
+    </nav>
     <div class="sp">
       <span class="spd">threads
         <select id="threads">
